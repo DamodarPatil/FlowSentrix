@@ -34,15 +34,21 @@ class NetGuardDatabase:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Main packets table
+        # Main packets table - Enhanced with Wireshark-inspired fields
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS packets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME NOT NULL,
+                packet_id INTEGER PRIMARY KEY,
+                absolute_timestamp DATETIME NOT NULL,
+                relative_time REAL,
                 src_ip TEXT NOT NULL,
                 dst_ip TEXT NOT NULL,
-                protocol TEXT NOT NULL,
-                size INTEGER NOT NULL,
+                src_port INTEGER,
+                dst_port INTEGER,
+                transport_protocol TEXT NOT NULL,
+                application_protocol TEXT,
+                tcp_flags TEXT,
+                direction TEXT,
+                packet_length INTEGER NOT NULL,
                 info TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
@@ -75,12 +81,17 @@ class NetGuardDatabase:
         # Create indexes for faster queries
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_packets_timestamp 
-            ON packets(timestamp)
+            ON packets(absolute_timestamp)
         """)
         
         cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_packets_protocol 
-            ON packets(protocol)
+            CREATE INDEX IF NOT EXISTS idx_packets_transport_protocol 
+            ON packets(transport_protocol)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_packets_application_protocol 
+            ON packets(application_protocol)
         """)
         
         cursor.execute("""
@@ -91,6 +102,11 @@ class NetGuardDatabase:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_packets_dst_ip 
             ON packets(dst_ip)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_packets_direction 
+            ON packets(direction)
         """)
         
         conn.commit()
@@ -146,7 +162,7 @@ class NetGuardDatabase:
     
     def insert_packet(self, packet_data: Dict):
         """
-        Insert a packet into the database.
+        Insert a packet into the database with enhanced fields.
         
         Args:
             packet_data: Dictionary containing packet information
@@ -155,18 +171,31 @@ class NetGuardDatabase:
         cursor = conn.cursor()
         
         cursor.execute("""
-            INSERT INTO packets (timestamp, src_ip, dst_ip, protocol, size, info)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO packets (
+                packet_id, absolute_timestamp, relative_time,
+                src_ip, dst_ip, src_port, dst_port,
+                transport_protocol, application_protocol, tcp_flags,
+                direction, packet_length, info
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            packet_data['timestamp'],
+            packet_data['packet_id'],
+            packet_data['absolute_timestamp'],
+            packet_data['relative_time'],
             packet_data['src'],  # Full IP address
             packet_data['dst'],  # Full IP address
-            packet_data['protocol'],
-            packet_data['size'],
+            packet_data.get('src_port'),
+            packet_data.get('dst_port'),
+            packet_data['transport_protocol'],
+            packet_data['application_protocol'],
+            packet_data.get('tcp_flags'),
+            packet_data['direction'],
+            packet_data['packet_length'],
             packet_data['info']
         ))
         
-        # Update protocol statistics
+        # Update protocol statistics (use application protocol if available, else transport)
+        protocol_for_stats = packet_data['application_protocol'] or packet_data['transport_protocol']
         cursor.execute("""
             INSERT INTO protocol_stats (protocol, packet_count, total_bytes, last_seen)
             VALUES (?, 1, ?, ?)
@@ -175,11 +204,11 @@ class NetGuardDatabase:
                 total_bytes = total_bytes + ?,
                 last_seen = ?
         """, (
-            packet_data['protocol'],
-            packet_data['size'],
-            packet_data['timestamp'],
-            packet_data['size'],
-            packet_data['timestamp']
+            protocol_for_stats,
+            packet_data['packet_length'],
+            packet_data['absolute_timestamp'],
+            packet_data['packet_length'],
+            packet_data['absolute_timestamp']
         ))
         
         conn.commit()
@@ -231,9 +260,10 @@ class NetGuardDatabase:
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT timestamp, src_ip, dst_ip, protocol, size, info
+            SELECT absolute_timestamp, src_ip, dst_ip, 
+                   application_protocol, packet_length, info
             FROM packets
-            ORDER BY id DESC
+            ORDER BY packet_id DESC
             LIMIT ?
         """, (limit,))
         
@@ -256,10 +286,11 @@ class NetGuardDatabase:
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT timestamp, src_ip, dst_ip, protocol, size, info
+            SELECT absolute_timestamp, src_ip, dst_ip, 
+                   application_protocol, packet_length, info
             FROM packets
             WHERE src_ip = ? OR dst_ip = ?
-            ORDER BY timestamp DESC
+            ORDER BY absolute_timestamp DESC
             LIMIT 1000
         """, (ip_address, ip_address))
         
@@ -270,10 +301,10 @@ class NetGuardDatabase:
     
     def search_by_protocol(self, protocol: str) -> List[tuple]:
         """
-        Search packets by protocol.
+        Search packets by protocol (searches both transport and application).
         
         Args:
-            protocol: Protocol name (TCP, UDP, DNS, etc.)
+            protocol: Protocol name (TCP, UDP, DNS, HTTPS, etc.)
             
         Returns:
             List of matching packets
@@ -282,12 +313,13 @@ class NetGuardDatabase:
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT timestamp, src_ip, dst_ip, protocol, size, info
+            SELECT absolute_timestamp, src_ip, dst_ip, 
+                   application_protocol, packet_length, info
             FROM packets
-            WHERE protocol = ?
-            ORDER BY timestamp DESC
+            WHERE transport_protocol = ? OR application_protocol = ?
+            ORDER BY absolute_timestamp DESC
             LIMIT 1000
-        """, (protocol,))
+        """, (protocol, protocol))
         
         packets = cursor.fetchall()
         conn.close()
@@ -357,7 +389,7 @@ class NetGuardDatabase:
     
     def export_to_csv(self, output_file: str, limit: Optional[int] = None):
         """
-        Export database to CSV file.
+        Export database to CSV file with all enhanced fields.
         
         Args:
             output_file: Path to output CSV file
@@ -368,7 +400,14 @@ class NetGuardDatabase:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        query = "SELECT timestamp, src_ip, dst_ip, protocol, size, info FROM packets ORDER BY id DESC"
+        query = """
+            SELECT packet_id, absolute_timestamp, relative_time,
+                   src_ip, dst_ip, src_port, dst_port,
+                   transport_protocol, application_protocol, tcp_flags,
+                   direction, packet_length, info
+            FROM packets 
+            ORDER BY packet_id ASC
+        """
         if limit:
             query += f" LIMIT {limit}"
         
@@ -376,7 +415,12 @@ class NetGuardDatabase:
         
         with open(output_file, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Timestamp', 'Source', 'Destination', 'Protocol', 'Size', 'Info'])
+            writer.writerow([
+                'Packet_ID', 'Absolute_Timestamp', 'Relative_Time',
+                'Source_IP', 'Destination_IP', 'Source_Port', 'Destination_Port',
+                'Transport_Protocol', 'Application_Protocol', 'TCP_Flags',
+                'Direction', 'Packet_Length', 'Info'
+            ])
             writer.writerows(cursor.fetchall())
         
         conn.close()
