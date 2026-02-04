@@ -133,6 +133,43 @@ def export_csv(db, output_file, limit=None):
     print(f"✅ Exported {count} packets to {output_file}")
 
 
+def delete_date(db, date_str, force=False):
+    """Delete packets for a specific date."""
+    print(f"\n🗑️  Deleting packets for date: {date_str}")
+    
+    if not force:
+        try:
+            response = input(f"Are you sure you want to delete all packets from {date_str}? [y/N] ")
+            if response.lower() != 'y':
+                print("Operation cancelled.")
+                return
+        except EOFError:
+            print("Error: Input stream closed. Use --force to skip confirmation.")
+            return
+
+    count = db.delete_packets_by_date(date_str)
+    print(f"✅ Deleted {count} packets.")
+
+
+def recalculate_stats(db):
+    """Recalculate protocol statistics from packets table."""
+    import sqlite3
+    print("\n🔄 Recalculating protocol statistics...")
+    
+    conn = sqlite3.connect(db.db_path)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM protocol_stats')
+    cursor.execute('''
+        INSERT INTO protocol_stats (protocol, packet_count, total_bytes, last_seen)
+        SELECT COALESCE(application_protocol, transport_protocol), COUNT(*), SUM(packet_length), MAX(absolute_timestamp)
+        FROM packets GROUP BY COALESCE(application_protocol, transport_protocol)
+    ''')
+    conn.commit()
+    conn.close()
+    
+    print("✅ Stats recalculated!")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="NetGuard Database Query Tool",
@@ -146,6 +183,8 @@ Examples:
   %(prog)s --top-talkers 20                Show top 20 active IPs
   %(prog)s --export output.csv             Export all to CSV
   %(prog)s --export output.csv --limit 1000  Export last 1000 to CSV
+  %(prog)s --delete-date 2026-02-04        Delete packets for specific date
+  %(prog)s --recalculate-stats             Rebuild protocol statistics
         """
     )
     
@@ -165,6 +204,12 @@ Examples:
                        help='Export database to CSV file')
     parser.add_argument('--limit', type=int, metavar='N',
                        help='Limit export to N packets (used with --export)')
+    parser.add_argument('--delete-date', metavar='YYYY-MM-DD',
+                       help='Delete packets for a specific date')
+    parser.add_argument('--force', action='store_true',
+                       help='Force deletion without confirmation')
+    parser.add_argument('--recalculate-stats', action='store_true',
+                       help='Recalculate protocol statistics from packets')
     
     args = parser.parse_args()
     
@@ -196,6 +241,12 @@ Examples:
     
     if args.export:
         export_csv(db, args.export, args.limit)
+    
+    if args.delete_date:
+        delete_date(db, args.delete_date, args.force)
+    
+    if args.recalculate_stats:
+        recalculate_stats(db)
     
     print()  # Final newline
 
