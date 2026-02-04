@@ -24,7 +24,9 @@ class NetGuardDatabase:
         self.db_path = db_path
         
         # Ensure data directory exists
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         
         # Create persistent connection
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -377,6 +379,46 @@ class NetGuardDatabase:
         """, (days,))
         
         deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        
+        return deleted
+    
+    def delete_packets_by_date(self, date_str: str) -> int:
+        """
+        Delete packets for a specific date.
+
+        Args:
+            date_str: Date string in YYYY-MM-DD format
+            
+        Returns:
+            Number of deleted packets
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # SQLite's date() function extracts the date part from the timestamp
+        cursor.execute("""
+            DELETE FROM packets
+            WHERE date(absolute_timestamp) = ?
+        """, (date_str,))
+        
+        deleted = cursor.rowcount
+        
+        # Recalculate protocol_stats from remaining packets
+        if deleted > 0:
+            cursor.execute("DELETE FROM protocol_stats")
+            cursor.execute("""
+                INSERT INTO protocol_stats (protocol, packet_count, total_bytes, last_seen)
+                SELECT 
+                    COALESCE(application_protocol, transport_protocol) as protocol,
+                    COUNT(*) as packet_count,
+                    SUM(packet_length) as total_bytes,
+                    MAX(absolute_timestamp) as last_seen
+                FROM packets
+                GROUP BY COALESCE(application_protocol, transport_protocol)
+            """)
+        
         conn.commit()
         conn.close()
         
