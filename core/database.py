@@ -4,6 +4,7 @@ SQLite-based storage for efficient packet capture analysis.
 """
 import sqlite3
 import os
+import threading
 from datetime import datetime
 from typing import Dict, Optional, List
 
@@ -22,6 +23,9 @@ class NetGuardDatabase:
             db_path: Path to SQLite database file
         """
         self.db_path = db_path
+        
+        # Thread safety lock for database operations
+        self._lock = threading.Lock()
         
         # Ensure data directory exists
         db_dir = os.path.dirname(db_path)
@@ -125,15 +129,16 @@ class NetGuardDatabase:
         Returns:
             Session ID
         """
-        self.cursor.execute("""
-            INSERT INTO sessions (start_time, interface)
-            VALUES (?, ?)
-        """, (datetime.now(), interface))
-        
-        session_id = self.cursor.lastrowid
-        self.conn.commit()
-        
-        return session_id
+        with self._lock:
+            self.cursor.execute("""
+                INSERT INTO sessions (start_time, interface)
+                VALUES (?, ?)
+            """, (datetime.now(), interface))
+            
+            session_id = self.cursor.lastrowid
+            self.conn.commit()
+            
+            return session_id
     
     def end_session(self, session_id: int, total_packets: int, total_bytes: int):
         """
@@ -144,16 +149,17 @@ class NetGuardDatabase:
             total_packets: Total packets captured
             total_bytes: Total bytes transferred
         """
-        self.cursor.execute("""
-            UPDATE sessions 
-            SET end_time = ?, 
-                total_packets = ?, 
-                total_bytes = ?,
-                status = 'completed'
-            WHERE id = ?
-        """, (datetime.now(), total_packets, total_bytes, session_id))
-        
-        self.conn.commit()
+        with self._lock:
+            self.cursor.execute("""
+                UPDATE sessions 
+                SET end_time = ?, 
+                    total_packets = ?, 
+                    total_bytes = ?,
+                    status = 'completed'
+                WHERE id = ?
+            """, (datetime.now(), total_packets, total_bytes, session_id))
+            
+            self.conn.commit()
     
     def insert_packet(self, packet_data: Dict):
         """
@@ -162,54 +168,56 @@ class NetGuardDatabase:
         Args:
             packet_data: Dictionary containing packet information
         """
-        # Let SQLite auto-generate packet_id via AUTOINCREMENT
-        self.cursor.execute("""
-            INSERT INTO packets (
-                absolute_timestamp, relative_time,
-                src_ip, dst_ip, src_port, dst_port,
-                transport_protocol, application_protocol, tcp_flags,
-                direction, packet_length, info
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            packet_data['absolute_timestamp'],
-            packet_data['relative_time'],
-            packet_data['src'],  # Full IP address
-            packet_data['dst'],  # Full IP address
-            packet_data.get('src_port'),
-            packet_data.get('dst_port'),
-            packet_data['transport_protocol'],
-            packet_data['application_protocol'],
-            packet_data.get('tcp_flags'),
-            packet_data['direction'],
-            packet_data['packet_length'],
-            packet_data['info']
-        ))
-        
-        # Update protocol statistics (use application protocol if available, else transport)
-        protocol_for_stats = packet_data['application_protocol'] or packet_data['transport_protocol']
-        self.cursor.execute("""
-            INSERT INTO protocol_stats (protocol, packet_count, total_bytes, last_seen)
-            VALUES (?, 1, ?, ?)
-            ON CONFLICT(protocol) DO UPDATE SET
-                packet_count = packet_count + 1,
-                total_bytes = total_bytes + ?,
-                last_seen = ?
-        """, (
-            protocol_for_stats,
-            packet_data['packet_length'],
-            packet_data['absolute_timestamp'],
-            packet_data['packet_length'],
-            packet_data['absolute_timestamp']
-        ))
-        
-        self.conn.commit()
+        with self._lock:
+            # Let SQLite auto-generate packet_id via AUTOINCREMENT
+            self.cursor.execute("""
+                INSERT INTO packets (
+                    absolute_timestamp, relative_time,
+                    src_ip, dst_ip, src_port, dst_port,
+                    transport_protocol, application_protocol, tcp_flags,
+                    direction, packet_length, info
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                packet_data['absolute_timestamp'],
+                packet_data['relative_time'],
+                packet_data['src'],  # Full IP address
+                packet_data['dst'],  # Full IP address
+                packet_data.get('src_port'),
+                packet_data.get('dst_port'),
+                packet_data['transport_protocol'],
+                packet_data['application_protocol'],
+                packet_data.get('tcp_flags'),
+                packet_data['direction'],
+                packet_data['packet_length'],
+                packet_data['info']
+            ))
+            
+            # Update protocol statistics (use application protocol if available, else transport)
+            protocol_for_stats = packet_data['application_protocol'] or packet_data['transport_protocol']
+            self.cursor.execute("""
+                INSERT INTO protocol_stats (protocol, packet_count, total_bytes, last_seen)
+                VALUES (?, 1, ?, ?)
+                ON CONFLICT(protocol) DO UPDATE SET
+                    packet_count = packet_count + 1,
+                    total_bytes = total_bytes + ?,
+                    last_seen = ?
+            """, (
+                protocol_for_stats,
+                packet_data['packet_length'],
+                packet_data['absolute_timestamp'],
+                packet_data['packet_length'],
+                packet_data['absolute_timestamp']
+            ))
+            
+            self.conn.commit()
     
     def close(self):
         """Close the database connection."""
-        if self.conn:
-            self.conn.close()
-            self.conn = None
+        with self._lock:
+            if self.conn:
+                self.conn.close()
+                self.conn = None
     
     def get_packet_count(self) -> int:
         """Get total number of packets in database."""

@@ -317,6 +317,72 @@ class PacketSniffer:
         
         return None, None
     
+    def _make_tcp_info_user_friendly(self, src_port, dst_port, flag_str, src_ip, dst_ip):
+        """
+        Convert technical TCP info into user-friendly description.
+        Keeps TCP flags but removes Seq/Ack/Win/Len numbers.
+        
+        Args:
+            src_port: Source port number
+            dst_port: Destination port number
+            flag_str: TCP flags string (e.g., 'SYN,ACK')
+            src_ip: Source IP address
+            dst_ip: Destination IP address
+            
+        Returns:
+            User-friendly info string with flags prepended
+        """
+        # Determine service name from port
+        service_names = {
+            80: 'HTTP', 443: 'HTTPS', 22: 'SSH', 21: 'FTP', 
+            20: 'FTP-DATA', 25: 'SMTP', 587: 'SMTP', 110: 'POP3',
+            143: 'IMAP', 993: 'IMAPS', 3306: 'MySQL', 5432: 'PostgreSQL',
+            27017: 'MongoDB', 6379: 'Redis', 8080: 'HTTP-ALT', 8443: 'HTTPS-ALT',
+            3389: 'RDP', 23: 'Telnet', 53: 'DNS'
+        }
+        
+        # Detect which port is the service port
+        if dst_port in service_names:
+            service = service_names[dst_port]
+            target_ip = dst_ip
+            target_port = dst_port
+            is_outgoing = True
+        elif src_port in service_names:
+            service = service_names[src_port]
+            target_ip = src_ip
+            target_port = src_port
+            is_outgoing = False
+        else:
+            # Unknown service - just show port numbers
+            service = f"Port {dst_port}"
+            target_ip = dst_ip
+            target_port = dst_port
+            is_outgoing = True
+        
+        # Create human-readable description based on TCP flags
+        if 'SYN' in flag_str and 'ACK' not in flag_str:
+            description = f"Opening connection to {target_ip}:{target_port} ({service})"
+        elif 'SYN' in flag_str and 'ACK' in flag_str:
+            description = f"Accepting connection from {target_ip}:{target_port} ({service})"
+        elif 'FIN' in flag_str or 'RST' in flag_str:
+            if is_outgoing:
+                description = f"Closing connection to {target_ip}:{target_port} ({service})"
+            else:
+                description = f"Closing connection from {target_ip}:{target_port} ({service})"
+        elif 'PSH' in flag_str and 'ACK' in flag_str:
+            if is_outgoing:
+                description = f"Sending data to {target_ip}:{target_port} ({service})"
+            else:
+                description = f"Receiving data from {target_ip}:{target_port} ({service})"
+        elif 'ACK' in flag_str:
+            description = f"Acknowledge to {target_ip}:{target_port} ({service})"
+        else:
+            description = f"TCP traffic with {target_ip}:{target_port} ({service})"
+        
+        # Prepend flags to description
+        flag_display = f"[{flag_str}]" if flag_str else ""
+        return f"{flag_display} {description}" if flag_display else description
+    
     def _extract_dns_info(self, packet):
         """
         Extract detailed DNS information: query type, domain name, response records.
@@ -415,7 +481,9 @@ class PacketSniffer:
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"[!] Worker error: {e}")
+                # Only print errors if we're not shutting down
+                if not self.stop_sniffing.is_set():
+                    print(f"[!] Worker error: {e}")
         self._processing_done.set()
     
     def _determine_direction(self, src_ip, dst_ip):
@@ -665,8 +733,8 @@ class PacketSniffer:
             
             packet_data['application_protocol'] = app_proto
             
-            # === Wireshark-style TCP Info: port → port [FLAGS] Seq=X Ack=X Win=X Len=X ===
-            packet_data['info'] = f'{src_port} → {dst_port} {flag_display} Seq={seq} Ack={ack_num} Win={win} Len={payload_len}'
+            # === User-friendly TCP Info with flags ===
+            packet_data['info'] = self._make_tcp_info_user_friendly(src_port, dst_port, flag_str, packet_data['src'], packet_data['dst'])
         
         # ==== UDP Protocol Handling ====
         elif UDP in packet:
@@ -822,7 +890,7 @@ class PacketSniffer:
         try:
             self.db.insert_packet(packet_data)
         except Exception as e:
-            print(f"[!] Warning: Could not log to database: {e}")
+            pass  # Silent during shutdown
     
     def _log_to_csv(self, packet_data):
         """Write packet data to CSV file."""
@@ -945,6 +1013,10 @@ class PacketSniffer:
         Callback executed for every captured packet with enhanced processing.
         Separates data extraction from display/logging logic.
         """
+        # Skip processing if we're shutting down
+        if self.stop_sniffing.is_set():
+            return
+        
         self.packets_captured += 1
         
         # Extract comprehensive data from raw packet
@@ -1052,18 +1124,30 @@ class PacketSniffer:
                     print("\n[!] Skipping queue drain (interrupted)")
             
             # Close CSV file if open
-            if hasattr(self, 'csv_file_handle') and self.csv_file_handle:
-                self.csv_file_handle.close()
+            try:
+                if hasattr(self, 'csv_file_handle') and self.csv_file_handle:
+                    self.csv_file_handle.close()
+            except Exception:
+                pass
             
             # End database session
-            if self.session_id:
-                self.db.end_session(self.session_id, self.packets_captured, self.total_bytes)
+            try:
+                if self.session_id:
+                    self.db.end_session(self.session_id, self.packets_captured, self.total_bytes)
+            except Exception:
+                pass
             
             # Close database connection
-            self.db.close()
+            try:
+                self.db.close()
+            except Exception:
+                pass
             
             # Always print summary on exit
-            if self.packets_captured > 0:
-                self._print_session_summary()
+            try:
+                if self.packets_captured > 0:
+                    self._print_session_summary()
+            except Exception:
+                pass
 
 
