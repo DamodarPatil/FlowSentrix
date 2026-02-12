@@ -2,7 +2,8 @@
 NetGuard Packet Sniffer Module
 Production-Ready: Phase 3 - Wireshark-Inspired Enhanced Monitoring
 """
-from scapy.all import sniff, IP, IPv6, TCP, UDP, ICMP, ICMPv6EchoRequest, ICMPv6EchoReply, ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6ND_RA, ICMPv6DestUnreach, ICMPv6PacketTooBig, ICMPv6TimeExceeded, ICMPv6MLReport2, ARP, Raw, get_if_list, conf, DNS, DNSQR, DNSRR
+from scapy.all import sniff, IP, IPv6, TCP, UDP, ICMP, ICMPv6EchoRequest, ICMPv6EchoReply, ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6ND_RA, ICMPv6DestUnreach, ICMPv6PacketTooBig, ICMPv6TimeExceeded, ICMPv6MLReport2, ARP, Raw, get_if_list, conf, DNS, DNSQR, DNSRR, Ether
+from scapy.layers.inet6 import ICMPv6NDOptSrcLLAddr
 from scapy.layers.http import HTTPRequest, HTTPResponse
 from datetime import datetime
 import threading
@@ -25,6 +26,10 @@ TLS_VERSIONS = {
     0x0300: 'SSLv3', 0x0301: 'TLSv1.0', 0x0302: 'TLSv1.1',
     0x0303: 'TLSv1.2', 0x0304: 'TLSv1.3'
 }
+
+# Set of known TLS record versions for validation (prevents false positives
+# from encrypted data whose random bytes happen to look like TLS content types)
+KNOWN_TLS_RECORD_VERSIONS = {0x0300, 0x0301, 0x0302, 0x0303, 0x0304}
 
 # TLS handshake type mapping
 TLS_HS_TYPES = {
@@ -68,6 +73,27 @@ class PacketSniffer:
         self.application_counts = {}  # HTTP, HTTPS, DNS, QUIC, etc.
         self.direction_counts = {'INCOMING': 0, 'OUTGOING': 0}
         self.total_bytes = 0
+        
+        # Per-flow TLS version tracking: once a handshake is seen on a TCP
+        # flow, all subsequent packets (ACKs, Application Data, etc.) on that
+        # flow inherit the negotiated TLS version instead of showing as bare TCP.
+        # Key: frozenset({(ip1, port1), (ip2, port2)})  Value: version string
+        self._tls_flow_versions = {}
+        
+        # Per-direction TCP stream state tracking for analysis labels.
+        # Key: (src_ip, src_port, dst_ip, dst_port)  — directional, NOT symmetric.
+        # Value: dict with 'next_expected_seq', 'last_ack', 'last_win', 'last_payload_len'
+        # This allows detecting Keep-Alive, Dup ACK, Out-Of-Order, Retransmission,
+        # and Window Update, matching Wireshark's TCP analysis behaviour.
+        self._tcp_stream_state = {}
+        
+        # Per-flow ISN (Initial Sequence Number) tracking for relative seq/ack
+        # Key: (ip, port, ip, port) directional  Value: ISN from that direction's SYN
+        self._tcp_isn_state = {}
+        
+        # Per-direction window scale factor tracking
+        # Key: (ip, port, ip, port) directional  Value: scale factor (e.g., 1024)
+        self._tcp_win_scale = {}
         
         # Get local IP for direction detection
         self.local_ip = self._get_local_ip()
@@ -185,21 +211,50 @@ class PacketSniffer:
         return ipv6_addr
 
     def _extract_tcp_flags(self, tcp_flags):
-        """Extract human-readable TCP flags from flags field."""
+        """Extract TCP flags in Wireshark's canonical order: FIN, SYN, RST, PSH, ACK, URG, ECE, CWR."""
         flag_names = []
-        if tcp_flags & 0x02:  # SYN
-            flag_names.append('SYN')
-        if tcp_flags & 0x10:  # ACK
-            flag_names.append('ACK')
         if tcp_flags & 0x01:  # FIN
             flag_names.append('FIN')
+        if tcp_flags & 0x02:  # SYN
+            flag_names.append('SYN')
         if tcp_flags & 0x04:  # RST
             flag_names.append('RST')
         if tcp_flags & 0x08:  # PSH
             flag_names.append('PSH')
+        if tcp_flags & 0x10:  # ACK
+            flag_names.append('ACK')
         if tcp_flags & 0x20:  # URG
             flag_names.append('URG')
-        return ','.join(flag_names) if flag_names else ''
+        if tcp_flags & 0x80:  # ECE
+            flag_names.append('ECE')
+        if tcp_flags & 0x40:  # CWR
+            flag_names.append('CWR')
+        return ', '.join(flag_names) if flag_names else ''
+    
+    def _extract_tcp_options(self, packet):
+        """Extract TCP options in Wireshark format (TSval, TSecr, MSS, WS, SACK_PERM, SLE, SRE)."""
+        opts = []
+        try:
+            for opt_name, opt_val in packet[TCP].options:
+                if opt_name == 'Timestamp':
+                    tsval, tsecr = opt_val
+                    opts.append(f'TSval={tsval}')
+                    opts.append(f'TSecr={tsecr}')
+                elif opt_name == 'MSS':
+                    opts.append(f'MSS={opt_val}')
+                elif opt_name == 'WScale':
+                    opts.append(f'WS={1 << opt_val}')
+                elif opt_name == 'SAckOK':
+                    opts.append('SACK_PERM')
+                elif opt_name == 'SAck':
+                    # SACK blocks: tuples of (left_edge, right_edge)
+                    if opt_val:
+                        for sle, sre in opt_val:
+                            opts.append(f'SLE={sle}')
+                            opts.append(f'SRE={sre}')
+        except Exception:
+            pass
+        return ' '.join(opts)
     
     def _extract_sni(self, payload):
         """Extract Server Name Indication (SNI) from TLS Client Hello payload."""
@@ -269,6 +324,13 @@ class PacketSniffer:
         """
         Deep TLS analysis: detect version, handshake type, and SNI.
         
+        Handles:
+        - TLS record types: Handshake (0x16), ChangeCipherSpec (0x14),
+          Application Data (0x17), Alert (0x15)
+        - SSLv2-style Client Hello detection (legacy compatibility)
+        - TLS 1.3 detection via supported_versions extension in both
+          Client Hello and Server Hello
+        
         Returns:
             tuple: (tls_version_str, info_str) or (None, None) if not TLS
         """
@@ -278,123 +340,419 @@ class PacketSniffer:
         content_type = payload[0]
         record_ver = (payload[1] << 8) | payload[2]
         
+        # --- SSLv2-style Client Hello detection ---
+        # SSLv2 records start with a length byte where bit 7 is set (>= 0x80)
+        # and byte[2] == 0x01 indicates a Client Hello message type
+        if (payload[0] & 0x80) != 0 and payload[2] == 0x01 and len(payload) >= 5:
+            # SSLv2 Client Hello: bytes[3:5] contain the version the client wants
+            client_ver = (payload[3] << 8) | payload[4]
+            tls_version = TLS_VERSIONS.get(client_ver, 'SSLv2')
+            return tls_version, 'Client Hello'
+        
+        # --- Validate record version to prevent false positives ---
+        # Encrypted data can have random first bytes that look like TLS content types.
+        # Only proceed if the record version is a known TLS version.
+        if record_ver not in KNOWN_TLS_RECORD_VERSIONS:
+            return None, None
+        
         # Content type 0x16 = Handshake
         if content_type == 0x16:
-            hs_type = payload[5] if len(payload) > 5 else None
-            hs_name = TLS_HS_TYPES.get(hs_type, f'Handshake Type {hs_type}')
+            # TLS Handshake - identify type
+            handshake_type = payload[5] if len(payload) > 5 else None
+            handshake_name = TLS_HS_TYPES.get(handshake_type, f"Handshake Type {handshake_type}")
             
-            # Determine TLS version from record header
-            tls_ver = TLS_VERSIONS.get(record_ver, f'TLS(0x{record_ver:04x})')
+            # Initialize tls_version with the record header version
+            tls_version = TLS_VERSIONS.get(record_ver, f'TLS(0x{record_ver:04x})')
             
-            if hs_type == 1:  # Client Hello
+            # Helper: scan extensions for supported_versions (0x002b)
+            def _scan_extensions_for_tls13(payload, offset, ext_end, is_server_hello=False):
+                """Scan TLS extensions for supported_versions. Returns 'TLSv1.3' or None."""
+                while offset + 4 <= ext_end and offset + 4 <= len(payload):
+                    ext_type = struct.unpack('!H', payload[offset:offset+2])[0]
+                    ext_len = struct.unpack('!H', payload[offset+2:offset+4])[0]
+                    offset += 4
+                    
+                    if ext_type == 0x002b:  # supported_versions
+                        if is_server_hello:
+                            # Server Hello: directly 2-byte selected version (no list)
+                            if offset + 2 <= len(payload):
+                                sv = struct.unpack('!H', payload[offset:offset+2])[0]
+                                if sv == 0x0304:
+                                    return 'TLSv1.3'
+                        else:
+                            # Client Hello: 1-byte list length + version list
+                            if offset + 1 <= len(payload):
+                                sv_offset = offset + 1
+                                while sv_offset + 2 <= offset + ext_len:
+                                    sv = struct.unpack('!H', payload[sv_offset:sv_offset+2])[0]
+                                    if sv == 0x0304:
+                                        return 'TLSv1.3'
+                                    sv_offset += 2
+                    
+                    offset += ext_len
+                return None
+            
+            # Special handling for Client Hello to check extensions for TLS 1.3
+            if handshake_type == 1:  # Client Hello
+                try:
+                    # Skip: 
+                    # - Record Header (5 bytes)
+                    # - Handshake Header (4 bytes: type + len)
+                    # - Protocol Version (2 bytes)
+                    # - Random (32 bytes)
+                    offset = 5 + 4 + 2 + 32
+                    
+                    # Session ID
+                    if offset < len(payload):
+                        sess_id_len = payload[offset]
+                        offset += 1 + sess_id_len
+                        
+                        # Cipher Suites
+                        if offset + 2 <= len(payload):
+                            cipher_len = struct.unpack('!H', payload[offset:offset+2])[0]
+                            offset += 2 + cipher_len
+                            
+                            # Compression Methods
+                            if offset < len(payload):
+                                comp_len = payload[offset]
+                                offset += 1 + comp_len
+                                
+                                # Extensions
+                                if offset + 2 <= len(payload):
+                                    ext_total_len = struct.unpack('!H', payload[offset:offset+2])[0]
+                                    offset += 2
+                                    ext_end = offset + ext_total_len
+                                    
+                                    result = _scan_extensions_for_tls13(payload, offset, ext_end, is_server_hello=False)
+                                    if result:
+                                        tls_version = result
+                except Exception:
+                    pass # Gracefully handle parsing errors in Client Hello
+                
                 sni = self._extract_sni(payload)
-                # Check for TLS 1.3 via supported_versions extension
-                # (Client Hello record says TLS 1.2 but may negotiate 1.3)
                 info = f'Client Hello'
                 if sni:
                     info += f' (SNI={sni})'
-                return tls_ver, info
-            elif hs_type == 2:  # Server Hello
-                return tls_ver, 'Server Hello'
+                return tls_version, info
+            
+            elif handshake_type == 2:  # Server Hello
+                try:
+                    # Skip:
+                    # - Record Header (5 bytes)
+                    # - Handshake Header (4 bytes: type + len)
+                    # - Protocol Version (2 bytes)
+                    # - Random (32 bytes)
+                    # - Session ID (1 byte len + variable)
+                    offset = 5 + 4 + 2 + 32
+                    
+                    if offset < len(payload):
+                        sess_id_len = payload[offset]
+                        offset += 1 + sess_id_len
+                        
+                        # Cipher Suite (2 bytes, selected single suite)
+                        offset += 2
+                        
+                        # Compression Method (1 byte)
+                        offset += 1
+                        
+                        # Extensions
+                        if offset + 2 <= len(payload):
+                            ext_total_len = struct.unpack('!H', payload[offset:offset+2])[0]
+                            offset += 2
+                            ext_end = offset + ext_total_len
+                            
+                            result = _scan_extensions_for_tls13(payload, offset, ext_end, is_server_hello=True)
+                            if result:
+                                tls_version = result
+                except Exception:
+                    pass  # Gracefully handle parsing errors in Server Hello
+                
+                # Parse remaining TLS records after the Server Hello handshake record
+                # (e.g., Change Cipher Spec, Application Data in the same TCP segment)
+                first_rec_len = struct.unpack('!H', payload[3:5])[0]  # Length from TLS record header
+                remaining_offset = 5 + first_rec_len  # Skip past the first TLS record (5-byte header + payload)
+                info_parts = ['Server Hello']
+                if remaining_offset < len(payload):
+                    remaining_payload = payload[remaining_offset:]
+                    _, extra_info = self._parse_tls_records(remaining_payload)
+                    if extra_info:
+                        info_parts.append(extra_info)
+                
+                return tls_version, ', '.join(info_parts)
             else:
-                return tls_ver, hs_name
+                return tls_version, handshake_name
         
-        # Content type 0x14 = Change Cipher Spec
-        elif content_type == 0x14:
-            tls_ver = TLS_VERSIONS.get(record_ver, f'TLS(0x{record_ver:04x})')
-            return tls_ver, 'Change Cipher Spec'
-        
-        # Content type 0x17 = Application Data (encrypted)
-        elif content_type == 0x17:
-            tls_ver = TLS_VERSIONS.get(record_ver, f'TLS(0x{record_ver:04x})')
-            data_len = struct.unpack('!H', payload[3:5])[0] if len(payload) >= 5 else 0
-            return tls_ver, f'Encrypted Data ({data_len} bytes)'
-        
-        # Content type 0x15 = Alert
-        elif content_type == 0x15:
-            tls_ver = TLS_VERSIONS.get(record_ver, f'TLS(0x{record_ver:04x})')
-            return tls_ver, 'Alert'
+        # For non-handshake record types, collect them and parse multiple records
+        elif content_type in (0x14, 0x15, 0x17):
+            return self._parse_tls_records(payload)
         
         return None, None
     
-    def _make_tcp_info_user_friendly(self, src_port, dst_port, flag_str, src_ip, dst_ip):
+    def _parse_tls_records(self, payload):
         """
-        Convert technical TCP info into user-friendly description.
-        Keeps TCP flags but removes Seq/Ack/Win/Len numbers.
+        Parse all TLS records in a payload and return combined info.
+        Handles multiple TLS records in a single TCP segment (e.g.,
+        'Change Cipher Spec, Application Data' or 'Application Data, Application Data').
+        Uses flow-negotiated version when available.
+        """
+        records = []
+        offset = 0
+        tls_version = None
+        
+        while offset + 5 <= len(payload):
+            ct = payload[offset]
+            rv = (payload[offset + 1] << 8) | payload[offset + 2]
+            
+            if rv not in KNOWN_TLS_RECORD_VERSIONS:
+                break
+            
+            rec_len = struct.unpack('!H', payload[offset + 3:offset + 5])[0]
+            ver = TLS_VERSIONS.get(rv, f'TLS(0x{rv:04x})')
+            if tls_version is None:
+                tls_version = ver
+            
+            if ct == 0x14:
+                records.append('Change Cipher Spec')
+            elif ct == 0x17:
+                records.append('Application Data')
+            elif ct == 0x15:
+                records.append('Alert')
+            elif ct == 0x16:
+                # Handshake record inside a multi-record payload
+                if offset + 5 < len(payload):
+                    hs_type = payload[offset + 5]
+                    hs_name = TLS_HS_TYPES.get(hs_type, f'Handshake Type {hs_type}')
+                    records.append(hs_name)
+                else:
+                    records.append('Handshake')
+            else:
+                break
+            
+            offset += 5 + rec_len
+        
+        if records:
+            return tls_version, ', '.join(records)
+        return None, None
+    
+    def _analyze_tcp_stream(self, src_ip, src_port, dst_ip, dst_port, seq, ack_num, win, payload_len, flag_str):
+        """
+        Analyze TCP stream state to detect Wireshark-style analysis labels.
+        
+        Uses per-direction state tracking (src→dst) to compare sequence/ack
+        numbers against expected values and detect anomalies.
+        
+        Detected labels:
+        - TCP Keep-Alive:  seq = next_expected - 1, payload 0-1 byte, ACK only
+        - TCP Keep-Alive ACK: ACK-only response to a Keep-Alive (same ack, zero payload)
+        - TCP Dup ACK:     same ack number repeated, zero payload, ACK only
+        - TCP Retransmission: seq < next_expected_seq AND payload > 0
+        - TCP Out-Of-Order: seq < next_expected_seq AND could be reordered segment
+        - TCP Window Update: same ack but different window size, zero payload
         
         Args:
-            src_port: Source port number
-            dst_port: Destination port number
-            flag_str: TCP flags string (e.g., 'SYN,ACK')
-            src_ip: Source IP address
-            dst_ip: Destination IP address
+            src_ip, src_port, dst_ip, dst_port: Flow identifiers
+            seq: TCP sequence number
+            ack_num: TCP acknowledgment number  
+            win: TCP window size
+            payload_len: TCP payload length
+            flag_str: TCP flags string
             
         Returns:
-            User-friendly info string with flags prepended
+            str or None: Analysis label like 'TCP Keep-Alive' or None
         """
-        # Determine service name from port
-        service_names = {
-            80: 'HTTP', 443: 'HTTPS', 22: 'SSH', 21: 'FTP', 
-            20: 'FTP-DATA', 25: 'SMTP', 587: 'SMTP', 110: 'POP3',
-            143: 'IMAP', 993: 'IMAPS', 3306: 'MySQL', 5432: 'PostgreSQL',
-            27017: 'MongoDB', 6379: 'Redis', 8080: 'HTTP-ALT', 8443: 'HTTPS-ALT',
-            3389: 'RDP', 23: 'Telnet', 53: 'DNS'
+        # Only analyze established connections (ignore SYN/FIN/RST)
+        if 'SYN' in flag_str or 'FIN' in flag_str or 'RST' in flag_str:
+            # Still update state for SYN packets (initial seq tracking)
+            fwd_key = (src_ip, src_port, dst_ip, dst_port)
+            if 'SYN' in flag_str:
+                self._tcp_stream_state[fwd_key] = {
+                    'next_expected_seq': seq + 1,
+                    'last_ack': ack_num,
+                    'last_win': win,
+                    'last_payload_len': 0,
+                    'last_seq': seq,
+                    'seen_keepalive': False,
+                    'dup_ack_count': 0,
+                    'orig_ack_pkt_id': self.packet_id
+                }
+                # Store ISN for this direction (for relative seq calculation)
+                self._tcp_isn_state[fwd_key] = seq
+            return None
+        
+        fwd_key = (src_ip, src_port, dst_ip, dst_port)
+        rev_key = (dst_ip, dst_port, src_ip, src_port)
+        
+        label = None
+        
+        # Get forward state (our previous state for this direction)
+        fwd_state = self._tcp_stream_state.get(fwd_key)
+        rev_state = self._tcp_stream_state.get(rev_key)
+        
+        if fwd_state and 'ACK' in flag_str:
+            next_expected = fwd_state['next_expected_seq']
+            
+            # --- TCP Keep-Alive Detection ---
+            # Wireshark heuristic: seq = next_expected - 1, payload 0 or 1 byte,
+            # flags are ACK only (no PSH)
+            if (payload_len <= 1 and 
+                seq == next_expected - 1 and
+                'PSH' not in flag_str):
+                label = 'TCP Keep-Alive'
+                # Mark reverse direction so next ACK can be labeled Keep-Alive ACK
+                if rev_state:
+                    rev_state['seen_keepalive'] = True
+            
+            # --- TCP Keep-Alive ACK Detection ---
+            # ACK-only response where the reverse direction just sent a Keep-Alive
+            elif (payload_len == 0 and
+                  'PSH' not in flag_str and
+                  fwd_state.get('seen_keepalive', False)):
+                label = 'TCP Keep-Alive ACK'
+                fwd_state['seen_keepalive'] = False
+            
+            # --- TCP Dup ACK Detection ---
+            # Same ack number repeated, zero payload, ACK only
+            elif (payload_len == 0 and
+                  ack_num == fwd_state['last_ack'] and
+                  win == fwd_state['last_win'] and
+                  seq == next_expected and
+                  'PSH' not in flag_str and
+                  fwd_state['last_payload_len'] == 0):
+                dup_count = fwd_state.get('dup_ack_count', 0) + 1
+                fwd_state['dup_ack_count'] = dup_count
+                orig_pkt = fwd_state.get('orig_ack_pkt_id', self.packet_id - 1)
+                label = f'TCP Dup ACK {orig_pkt}#{dup_count}'
+            
+            # --- TCP Retransmission / Out-Of-Order Detection ---
+            elif (payload_len > 0 and seq < next_expected):
+                # If seq + payload_len <= next_expected, it's a full retransmission
+                # If seq + payload_len > next_expected, it could be out-of-order
+                if seq + payload_len <= next_expected:
+                    label = 'TCP Retransmission'
+                else:
+                    label = 'TCP Out-Of-Order'
+            
+            # --- TCP Window Update Detection ---
+            elif (payload_len == 0 and
+                  ack_num == fwd_state['last_ack'] and
+                  win != fwd_state['last_win'] and
+                  'PSH' not in flag_str):
+                label = 'TCP Window Update'
+            
+            # --- TCP ACKed unseen segment Detection ---
+            # Our ACK references data from the peer that we haven't tracked yet
+            elif (payload_len == 0 and
+                  'PSH' not in flag_str and
+                  rev_state is None and
+                  ack_num > 0):
+                label = 'TCP ACKed unseen segment'
+        
+        # --- TCP Previous segment not captured ---
+        # Data packet where seq > next_expected_seq (gap)
+        if fwd_state and payload_len > 0 and label is None:
+            if seq > fwd_state['next_expected_seq']:
+                label = 'TCP Previous segment not captured'
+        
+        # Update forward state for next packet comparison
+        new_next_expected = seq + payload_len if payload_len > 0 else (fwd_state['next_expected_seq'] if fwd_state else seq)
+        # Only advance next_expected_seq if the new data goes beyond what we've seen
+        if fwd_state and payload_len > 0:
+            new_next_expected = max(fwd_state['next_expected_seq'], seq + payload_len)
+        
+        # Reset dup_ack_count when ack number changes
+        dup_ack_count = fwd_state.get('dup_ack_count', 0) if fwd_state else 0
+        orig_ack_pkt_id = fwd_state.get('orig_ack_pkt_id', self.packet_id) if fwd_state else self.packet_id
+        if fwd_state and ack_num != fwd_state['last_ack']:
+            dup_ack_count = 0
+            orig_ack_pkt_id = self.packet_id
+        
+        self._tcp_stream_state[fwd_key] = {
+            'next_expected_seq': new_next_expected,
+            'last_ack': ack_num,
+            'last_win': win,
+            'last_payload_len': payload_len,
+            'last_seq': seq,
+            'seen_keepalive': fwd_state.get('seen_keepalive', False) if fwd_state else False,
+            'dup_ack_count': dup_ack_count,
+            'orig_ack_pkt_id': orig_ack_pkt_id
         }
         
-        # Detect which port is the service port
-        if dst_port in service_names:
-            service = service_names[dst_port]
-            target_ip = dst_ip
-            target_port = dst_port
-            is_outgoing = True
-        elif src_port in service_names:
-            service = service_names[src_port]
-            target_ip = src_ip
-            target_port = src_port
-            is_outgoing = False
-        else:
-            # Unknown service - just show port numbers
-            service = f"Port {dst_port}"
-            target_ip = dst_ip
-            target_port = dst_port
-            is_outgoing = True
+        return label
+    
+    def _format_tcp_info_wireshark(self, packet, src_port, dst_port, flag_str, seq, ack_num, win, payload_len, tcp_analysis_label=None, extra_suffix=''):
+        """
+        Generate Wireshark-exact info string for TCP packets.
+        Uses relative seq/ack (ISN-based) and scaled window values.
         
-        # Create human-readable description based on TCP flags
-        if 'SYN' in flag_str and 'ACK' not in flag_str:
-            description = f"Opening connection to {target_ip}:{target_port} ({service})"
-        elif 'SYN' in flag_str and 'ACK' in flag_str:
-            description = f"Accepting connection from {target_ip}:{target_port} ({service})"
-        elif 'FIN' in flag_str or 'RST' in flag_str:
-            if is_outgoing:
-                description = f"Closing connection to {target_ip}:{target_port} ({service})"
-            else:
-                description = f"Closing connection from {target_ip}:{target_port} ({service})"
-        elif 'PSH' in flag_str and 'ACK' in flag_str:
-            if is_outgoing:
-                description = f"Sending data to {target_ip}:{target_port} ({service})"
-            else:
-                description = f"Receiving data from {target_ip}:{target_port} ({service})"
-        elif 'ACK' in flag_str:
-            description = f"Acknowledge to {target_ip}:{target_port} ({service})"
-        else:
-            description = f"TCP traffic with {target_ip}:{target_port} ({service})"
+        Format: [analysis] src_port  >  dst_port [FLAGS] Seq=X Ack=X Win=X Len=X OPTIONS [suffix]
+        """
+        parts = []
         
-        # Prepend flags to description
-        flag_display = f"[{flag_str}]" if flag_str else ""
-        return f"{flag_display} {description}" if flag_display else description
+        # == Compute relative seq/ack ==
+        src_ip = packet[IP].src if IP in packet else (packet[IPv6].src if IPv6 in packet else '')
+        dst_ip = packet[IP].dst if IP in packet else (packet[IPv6].dst if IPv6 in packet else '')
+        
+        fwd_key = (src_ip, src_port, dst_ip, dst_port)
+        rev_key = (dst_ip, dst_port, src_ip, src_port)
+        
+        # Relative seq: subtract this direction's ISN
+        rel_seq = seq
+        fwd_isn = self._tcp_isn_state.get(fwd_key)
+        if fwd_isn is not None:
+            rel_seq = (seq - fwd_isn) & 0xFFFFFFFF  # Handle wrap-around
+        
+        # Relative ack: subtract the peer direction's ISN
+        rel_ack = ack_num
+        rev_isn = self._tcp_isn_state.get(rev_key)
+        if rev_isn is not None:
+            rel_ack = (ack_num - rev_isn) & 0xFFFFFFFF
+        
+        # == Compute scaled window ==
+        scaled_win = win
+        win_scale = self._tcp_win_scale.get(fwd_key)
+        if win_scale is not None and win_scale > 0:
+            scaled_win = win * win_scale
+        
+        # 1. Analysis label prefix (if any)
+        if tcp_analysis_label:
+            parts.append(f'[{tcp_analysis_label}]')
+        
+        # 2. Port > Port [FLAGS]
+        parts.append(f'{src_port}  >  {dst_port} [{flag_str}]')
+        
+        # 3. Seq/Ack/Win/Len
+        parts.append(f'Seq={rel_seq}')
+        if 'ACK' in flag_str:
+            parts.append(f'Ack={rel_ack}')
+        parts.append(f'Win={scaled_win}')
+        parts.append(f'Len={payload_len}')
+        
+        # 4. TCP options (TSval, TSecr, MSS, WS, SACK_PERM, SLE, SRE)
+        tcp_opts = self._extract_tcp_options(packet)
+        if tcp_opts:
+            parts.append(tcp_opts)
+        
+        # 5. Extra suffix (e.g., '[TCP segment of a reassembled PDU]')
+        if extra_suffix:
+            parts.append(extra_suffix)
+        
+        return ' '.join(parts)
     
     def _extract_dns_info(self, packet):
         """
-        Extract detailed DNS information: query type, domain name, response records.
+        Extract Wireshark-format DNS information: transaction ID, query type, domain name, response records.
         
         Returns:
-            str: Detailed DNS info string
+            str: Wireshark-format DNS info string
         """
         try:
             if not packet.haslayer(DNS):
-                return 'DNS | Domain Name Lookup'
+                return 'DNS'
             
             dns = packet[DNS]
+            
+            # Transaction ID in hex
+            txn_id = f'0x{dns.id:04x}' if dns.id is not None else ''
             
             # Get query name and type
             qname = ''
@@ -407,27 +765,65 @@ class PacketSniffer:
                     qname = str(raw_qname).rstrip('.')
                 qtype_name = DNS_QTYPES.get(dns.qd.qtype, str(dns.qd.qtype))
             
+            # EDNS0 (OPT record) detection
+            has_opt = False
+            if dns.ar:
+                try:
+                    rr = dns.ar
+                    while rr:
+                        if hasattr(rr, 'type') and rr.type == 41:  # OPT record
+                            has_opt = True
+                            break
+                        rr = rr.payload if hasattr(rr, 'payload') and rr.payload and rr.payload.name != 'NoPayload' else None
+                except Exception:
+                    pass
+            opt_suffix = ' OPT' if has_opt else ''
+            
             if dns.qr == 0:  # Query
-                return f'Standard query {qtype_name} {qname}'
+                return f'Standard query {txn_id} {qtype_name} {qname}{opt_suffix}'
             else:  # Response
                 answers = []
-                # dns.an is a list-like object in modern Scapy; ancount can be None
                 if dns.an:
                     for i, rr in enumerate(dns.an):
-                        if i >= 4:  # Limit for readability
+                        if i >= 8:  # Wireshark shows many
                             break
                         try:
                             if hasattr(rr, 'type') and hasattr(rr, 'rdata'):
                                 rtype = DNS_QTYPES.get(rr.type, str(rr.type))
-                                rdata = str(rr.rdata).rstrip('.')
+                                rdata = rr.rdata
+                                # Clean up bytes objects (CNAME, SOA, etc.)
+                                if isinstance(rdata, bytes):
+                                    rdata = rdata.decode('utf-8', errors='replace').rstrip('.')
+                                else:
+                                    rdata = str(rdata).rstrip('.')
                                 answers.append(f'{rtype} {rdata}')
                         except Exception:
                             pass
                 
-                answer_str = ', '.join(answers) if answers else 'No records'
-                return f'Standard query response {qtype_name} {qname} → {answer_str}'
+                # Check additional records for SOA (authority section)
+                if dns.ns:
+                    try:
+                        for i, rr in enumerate(dns.ns):
+                            if i >= 2:
+                                break
+                            if hasattr(rr, 'type') and rr.type == 6:  # SOA
+                                mname = rr.mname
+                                if isinstance(mname, bytes):
+                                    mname = mname.decode('utf-8', errors='replace').rstrip('.')
+                                else:
+                                    mname = str(mname).rstrip('.')
+                                answers.append(f'SOA {mname}')
+                    except Exception:
+                        pass
+                
+                if not answers:
+                    answer_str = ''
+                else:
+                    answer_str = ' ' + ' '.join(answers)
+                
+                return f'Standard query response {txn_id} {qtype_name} {qname}{answer_str}{opt_suffix}'
         except Exception:
-            return 'DNS | Domain Name Lookup'
+            return 'DNS'
     
     def _extract_http_info(self, packet):
         """
@@ -470,6 +866,40 @@ class PacketSniffer:
     def _fast_callback(self, packet):
         """Ultra-fast sniff callback — just queue the packet, zero processing."""
         self._packet_queue.put(packet)
+    
+    def _raw_capture(self, iface, count=0):
+        """
+        High-speed packet capture using Linux AF_PACKET raw socket.
+        Bypasses Scapy's sniff() overhead for kernel-level speed.
+        Each raw frame is parsed with Scapy's Ether() for compatibility.
+        
+        Args:
+            iface: Network interface name (required for AF_PACKET)
+            count: Number of packets to capture (0 = infinite)
+        """
+        from scapy.all import Ether
+        
+        raw_sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(3))
+        raw_sock.bind((iface, 0))
+        raw_sock.settimeout(0.5)
+        
+        captured = 0
+        try:
+            while not self.stop_sniffing.is_set():
+                try:
+                    raw_data = raw_sock.recv(65535)
+                    packet = Ether(raw_data)
+                    self._packet_queue.put(packet)
+                    captured += 1
+                    if count > 0 and captured >= count:
+                        break
+                except socket.timeout:
+                    continue
+                except Exception:
+                    if not self.stop_sniffing.is_set():
+                        continue
+        finally:
+            raw_sock.close()
     
     def _packet_worker(self):
         """Worker thread: drain queue and process packets with full analysis."""
@@ -630,6 +1060,17 @@ class PacketSniffer:
             flag_str = packet_data['tcp_flags']
             flag_display = f"[{flag_str}]" if flag_str else ""
             
+            # Extract window scale from SYN/SYN-ACK for future window scaling
+            if tcp_flags_raw & 0x02:  # SYN flag set
+                fwd_key = (packet_data['src'], src_port, packet_data['dst'], dst_port)
+                try:
+                    for opt_name, opt_val in packet[TCP].options:
+                        if opt_name == 'WScale':
+                            self._tcp_win_scale[fwd_key] = (1 << opt_val) if opt_val else 1
+                            break
+                except Exception:
+                    pass
+            
             # === Deep Protocol Detection (content-based, like Wireshark) ===
             
             # 1. Try HTTP layer detection first (Scapy auto-detects HTTP content)
@@ -644,15 +1085,34 @@ class PacketSniffer:
                 payload = bytes(packet[Raw].load)
                 tls_ver, tls_info = self._analyze_tls_payload(payload)
                 if tls_ver and tls_info:
+                    # Record the TLS version for this flow so subsequent
+                    # packets (ACKs, empty data) inherit the correct version
+                    flow_key = frozenset({
+                        (packet_data['src'], src_port),
+                        (packet_data['dst'], dst_port)
+                    })
+                    # Server Hello determines the *negotiated* version, so it
+                    # takes precedence over Client Hello (which only advertises)
+                    if 'Server Hello' in tls_info or 'Hello Retry Request' in tls_info or flow_key not in self._tls_flow_versions:
+                        self._tls_flow_versions[flow_key] = tls_ver
+                    
+                    # Override TLS record version with flow-negotiated version
+                    # (e.g., record says TLSv1.2 but flow negotiated TLSv1.3)
+                    known_ver = self._tls_flow_versions.get(flow_key)
+                    if known_ver and known_ver != tls_ver:
+                        # For Application Data, CCS, Alert — use negotiated version
+                        if any(x in tls_info for x in ('Application Data', 'Change Cipher Spec', 'Alert')):
+                            tls_ver = known_ver
+                    
                     packet_data['application_protocol'] = tls_ver
                     packet_data['info'] = tls_info
                     return packet_data
             
             # 3. Port-based application protocol fallback
+            #    Wireshark rule: protocol = TCP unless there's actual TLS payload.
+            #    ACK-only packets on port 443 stay as 'TCP', not 'TLSv1.3'.
             app_proto = 'TCP'
-            if dst_port == 443 or src_port == 443:
-                app_proto = 'TCP'  # TLS detection handled above; bare TCP to 443
-            elif dst_port == 80 or src_port == 80:
+            if dst_port == 80 or src_port == 80:
                 app_proto = 'HTTP'
             elif dst_port == 22 or src_port == 22:
                 app_proto = 'SSH'
@@ -686,8 +1146,6 @@ class PacketSniffer:
                 app_proto = 'HTTPS-ALT'
             elif dst_port == 23 or src_port == 23:
                 app_proto = 'Telnet'
-            elif dst_port == 9001 or src_port == 9001:
-                app_proto = 'Tor'
             elif dst_port == 9050 or src_port == 9050:
                 app_proto = 'Tor-SOCKS'
             elif dst_port == 9150 or src_port == 9150:
@@ -733,8 +1191,26 @@ class PacketSniffer:
             
             packet_data['application_protocol'] = app_proto
             
-            # === User-friendly TCP Info with flags ===
-            packet_data['info'] = self._make_tcp_info_user_friendly(src_port, dst_port, flag_str, packet_data['src'], packet_data['dst'])
+            # === TCP Stream Analysis (Wireshark-style labels) ===
+            tcp_analysis_label = self._analyze_tcp_stream(
+                packet_data['src'], src_port,
+                packet_data['dst'], dst_port,
+                seq, ack_num, win, payload_len, flag_str
+            )
+            
+            # === Detect [TCP segment of a reassembled PDU] ===
+            # Data packets without PSH flag (not the last segment)
+            extra_suffix = ''
+            if payload_len > 0 and 'PSH' not in flag_str and 'SYN' not in flag_str and 'FIN' not in flag_str:
+                extra_suffix = '[TCP segment of a reassembled PDU]'
+            
+            # === Wireshark-exact TCP Info ===
+            packet_data['info'] = self._format_tcp_info_wireshark(
+                packet, src_port, dst_port, flag_str,
+                seq, ack_num, win, payload_len,
+                tcp_analysis_label=tcp_analysis_label,
+                extra_suffix=extra_suffix
+            )
         
         # ==== UDP Protocol Handling ====
         elif UDP in packet:
@@ -753,12 +1229,33 @@ class PacketSniffer:
                 app_proto = 'QUIC'
                 
                 # Check for QUIC packet patterns in payload
+                # QUIC v1 (RFC 9000): All packets have the Fixed Bit (0x40) set.
+                # Long Header: bit 7 (0x80) set — Initial, 0-RTT, Handshake, Retry
+                # Short Header: bit 7 clear, but Fixed Bit (0x40) still set
                 if packet.haslayer(Raw):
                     payload = bytes(packet[Raw].load)
-                    if len(payload) > 0 and (payload[0] & 0x80):
-                        packet_data['info'] = 'QUIC: Connection Handshake'
+                    if len(payload) > 0:
+                        first_byte = payload[0]
+                        if first_byte & 0x80:  # Long Header
+                            # Determine specific long header type from bits 4-5
+                            long_type = (first_byte & 0x30) >> 4
+                            if long_type == 0:
+                                packet_data['info'] = 'QUIC: Initial'
+                            elif long_type == 1:
+                                packet_data['info'] = 'QUIC: 0-RTT'
+                            elif long_type == 2:
+                                packet_data['info'] = 'QUIC: Handshake'
+                            elif long_type == 3:
+                                packet_data['info'] = 'QUIC: Retry'
+                            else:
+                                packet_data['info'] = 'QUIC: Connection Handshake'
+                        elif first_byte & 0x40:  # Short Header (Fixed Bit set)
+                            packet_data['info'] = f'QUIC: Protected Payload ({len(payload)} bytes)'
+                        else:
+                            # Neither long nor short header — possibly Version Negotiation
+                            packet_data['info'] = f'QUIC: Encrypted Data ({len(payload)} bytes)'
                     else:
-                        packet_data['info'] = f'QUIC: Encrypted Data ({len(payload)} bytes)'
+                        packet_data['info'] = 'QUIC: Empty Payload'
                 else:
                     packet_data['info'] = f'QUIC: Protected Payload'
             elif dst_port == 53 or src_port == 53:
@@ -849,9 +1346,24 @@ class PacketSniffer:
             
             # Check for specific ICMPv6 layers
             if packet.haslayer(ICMPv6ND_NS):
-                packet_data['info'] = 'ICMPv6: Neighbor Solicitation (IPv6 ARP Request)'
+                ns_layer = packet[ICMPv6ND_NS]
+                target_addr = ns_layer.tgt
+                # Extract source link-layer address from options if present
+                src_mac = ''
+                if packet.haslayer(ICMPv6NDOptSrcLLAddr):
+                    src_mac = packet[ICMPv6NDOptSrcLLAddr].lladdr
+                elif hasattr(packet, 'src') and Ether in packet:
+                    src_mac = packet[Ether].src
+                if src_mac:
+                    packet_data['info'] = f'Neighbor Solicitation for {target_addr} from {src_mac}'
+                else:
+                    packet_data['info'] = f'Neighbor Solicitation for {target_addr}'
             elif packet.haslayer(ICMPv6ND_NA):
-                packet_data['info'] = 'ICMPv6: Neighbor Advertisement (IPv6 ARP Reply)'
+                na_layer = packet[ICMPv6ND_NA]
+                target_addr = na_layer.tgt
+                # Check if solicited flag is set (R=0, S=1, O=1 typical for solicited)
+                sol_flag = '(sol)' if na_layer.S else '(rtr)'
+                packet_data['info'] = f'Neighbor Advertisement {target_addr} {sol_flag}'
             elif packet.haslayer(ICMPv6ND_RA):
                 dst_type = self._classify_ipv6_address(packet_data['dst'])
                 if dst_type == "Multicast-Link":
@@ -1092,13 +1604,19 @@ class PacketSniffer:
             )
             self._worker_thread.start()
             
-            # Start sniffing with ultra-fast callback (just queues packets)
-            sniff(
-                iface=self.interface,
-                prn=self._fast_callback,
-                count=count,
-                store=False
-            )
+            # Start sniffing — use AF_PACKET raw socket when possible (Linux + specific interface)
+            # AF_PACKET bypasses Scapy's internal overhead for kernel-level speed
+            if self.interface and hasattr(socket, 'AF_PACKET'):
+                print("Capture Engine: AF_PACKET raw socket (kernel-level speed)")
+                self._raw_capture(self.interface, count=count)
+            else:
+                # Fallback to Scapy's sniff() for cross-platform or all-interface capture
+                sniff(
+                    iface=self.interface,
+                    prn=self._fast_callback,
+                    count=count,
+                    store=False
+                )
             
         except KeyboardInterrupt:
             print("\n\n[!] Capture interrupted by user (Ctrl+C)")
