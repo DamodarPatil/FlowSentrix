@@ -227,7 +227,10 @@ Examples:
     if args.stats:
         show_stats(db)
     
-    if args.recent:
+    if args.recent is not None:
+        if args.recent <= 0:
+            print("[!] Error: --recent must be a positive number.")
+            sys.exit(1)
         show_recent(db, args.recent)
     
     if args.ip:
@@ -236,11 +239,19 @@ Examples:
     if args.protocol:
         search_protocol(db, args.protocol)
     
-    if args.top_talkers:
+    if args.top_talkers is not None:
+        if args.top_talkers <= 0:
+            print("[!] Error: --top-talkers must be a positive number.")
+            sys.exit(1)
         show_top_talkers(db, args.top_talkers)
     
     if args.export:
+        if args.limit is not None and args.limit <= 0:
+            print("[!] Error: --limit must be a positive number.")
+            sys.exit(1)
         export_csv(db, args.export, args.limit)
+    elif args.limit is not None:
+        print("[!] Warning: --limit has no effect without --export.")
     
     if args.delete_date:
         delete_date(db, args.delete_date, args.force)

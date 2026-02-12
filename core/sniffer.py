@@ -44,7 +44,7 @@ class PacketSniffer:
     Production-ready with statistics tracking, database storage, and robust error handling.
     """
     
-    def __init__(self, interface=None, db_path="data/netguard.db", csv_file=None):
+    def __init__(self, interface=None, db_path="data/netguard.db", csv_file=None, on_packet=None):
         """
         Initialize the packet sniffer with Wireshark-inspired features.
         
@@ -52,10 +52,14 @@ class PacketSniffer:
             interface: Network interface to sniff (None = all interfaces)
             db_path: Path to SQLite database file (default: data/netguard.db)
             csv_file: Optional CSV file for real-time logging
+            on_packet: Optional callback(packet_data) for external consumers (CLI/GUI).
+                       When set, replaces built-in console output.
         """
         self.interface = interface
         self.db_path = db_path
         self.csv_file = csv_file
+        self.on_packet = on_packet
+        self.quiet = on_packet is not None  # Suppress built-in output when external consumer exists
         self.stop_sniffing = threading.Event()
         
         # Queue-based capture: producer-consumer pattern for zero-drop capture
@@ -1880,24 +1884,28 @@ class PacketSniffer:
             if self.csv_writer:
                 self._log_to_csv(data)
             
-            # Display to console with enhanced formatting
-            # Format: [ID] [Timestamp] [RelTime] PROTO | SRC:PORT → DST:PORT | DIR | SIZE | INFO
-            src_display = f"{data['display_src']}:{data.get('src_port', '')}" if data.get('src_port') else data['display_src']
-            dst_display = f"{data['display_dst']}:{data.get('dst_port', '')}" if data.get('dst_port') else data['display_dst']
-            
-            # Build protocol display (show application if available)
-            proto_display = data['application_protocol'] if data['application_protocol'] != 'UNKNOWN' else data['transport_protocol']
-            
-            print(
-                f"[{data['packet_id']:<5}] "
-                f"[{data['absolute_timestamp']}] "
-                f"[{data['relative_time']:>8.3f}s] "
-                f"{proto_display:<8} | "
-                f"{src_display:<22} → {dst_display:<22} | "
-                f"{data['direction']:<8} | "
-                f"{data['packet_length']:<5}B | "
-                f"{data['info']}"
-            )
+            # Display to console or send to external callback
+            if self.on_packet:
+                # Send to external consumer (CLI/GUI)
+                self.on_packet(data)
+            else:
+                # Legacy: direct console output
+                src_display = f"{data['display_src']}:{data.get('src_port', '')}" if data.get('src_port') else data['display_src']
+                dst_display = f"{data['display_dst']}:{data.get('dst_port', '')}" if data.get('dst_port') else data['display_dst']
+                
+                # Build protocol display (show application if available)
+                proto_display = data['application_protocol'] if data['application_protocol'] != 'UNKNOWN' else data['transport_protocol']
+                
+                print(
+                    f"[{data['packet_id']:<5}] "
+                    f"[{data['absolute_timestamp']}] "
+                    f"[{data['relative_time']:>8.3f}s] "
+                    f"{proto_display:<8} | "
+                    f"{src_display:<22} → {dst_display:<22} | "
+                    f"{data['direction']:<8} | "
+                    f"{data['packet_length']:<5}B | "
+                    f"{data['info']}"
+                )
 
     def start(self, count=0):
         """
@@ -1917,18 +1925,19 @@ class PacketSniffer:
             # Initialize capture start time
             self.capture_start_time = datetime.now()
             
-            print(f"🛡️  NetGuard Wireshark-Inspired Monitoring Started")
-            print(f"Interface: {self.interface or 'All'}")
-            print(f"Local IPs: {', '.join(self.local_ip)}")
-            print(f"Database: {self.db_path}")
-            if self.csv_file:
-                print(f"CSV Export: {self.csv_file}")
-            print(f"Session ID: {self.session_id}")
-            print(f"Packets to Capture: {count if count > 0 else '∞'}")
-            print(f"Capture Mode: Queue-based (zero-drop)")
-            print("-" * 100)
-            print(f"{'[ID]':<7} {'[Timestamp]':<27} {'[RelTime]':<10} {'PROTOCOL':<9} | {'SOURCE':<22} → {'DESTINATION':<22} | {'DIRECTION':<9} | {'SIZE':<6} | INFO")
-            print("-" * 100 + "\n")
+            if not self.quiet:
+                print(f"🛡️  NetGuard Wireshark-Inspired Monitoring Started")
+                print(f"Interface: {self.interface or 'All'}")
+                print(f"Local IPs: {', '.join(self.local_ip)}")
+                print(f"Database: {self.db_path}")
+                if self.csv_file:
+                    print(f"CSV Export: {self.csv_file}")
+                print(f"Session ID: {self.session_id}")
+                print(f"Packets to Capture: {count if count > 0 else '∞'}")
+                print(f"Capture Mode: Queue-based (zero-drop)")
+                print("-" * 100)
+                print(f"{'[ID]':<7} {'[Timestamp]':<27} {'[RelTime]':<10} {'PROTOCOL':<9} | {'SOURCE':<22} → {'DESTINATION':<22} | {'DIRECTION':<9} | {'SIZE':<6} | INFO")
+                print("-" * 100 + "\n")
             
             # Start worker thread for packet processing
             self._worker_thread = threading.Thread(
@@ -1941,7 +1950,8 @@ class PacketSniffer:
             # Start sniffing — use AF_PACKET raw socket when possible (Linux + specific interface)
             # AF_PACKET bypasses Scapy's internal overhead for kernel-level speed
             if self.interface and hasattr(socket, 'AF_PACKET'):
-                print("Capture Engine: AF_PACKET raw socket (kernel-level speed)")
+                if not self.quiet:
+                    print("Capture Engine: AF_PACKET raw socket (kernel-level speed)")
                 self._raw_capture(self.interface, count=count)
             else:
                 # Fallback to Scapy's sniff() for cross-platform or all-interface capture
@@ -1953,27 +1963,36 @@ class PacketSniffer:
                 )
             
         except KeyboardInterrupt:
-            print("\n\n[!] Capture interrupted by user (Ctrl+C)")
+            if not self.quiet:
+                print("\n\n[!] Capture interrupted by user (Ctrl+C)")
             
         except PermissionError:
-            print("[!] Error: Root/sudo privileges required for packet capture!")
-            print("    Run with: sudo python3 test_sniffer.py")
+            if not self.quiet:
+                print("[!] Error: Root/sudo privileges required for packet capture!")
+                print("    Run with: sudo python3 netguard.py")
+            raise
             
         except ValueError as e:
-            print(f"[!] Configuration Error: {e}")
+            if not self.quiet:
+                print(f"[!] Configuration Error: {e}")
+            raise
             
         except Exception as e:
-            print(f"[!] Sniffer Error: {e}")
+            if not self.quiet:
+                print(f"[!] Sniffer Error: {e}")
+            raise
             
         finally:
             # Signal worker to stop and wait for it to drain the queue
             self.stop_sniffing.set()
             if self._worker_thread and self._worker_thread.is_alive():
                 try:
-                    print("[*] Processing remaining queued packets...")
+                    if not self.quiet:
+                        print("[*] Processing remaining queued packets...")
                     self._worker_thread.join(timeout=10)
                 except KeyboardInterrupt:
-                    print("\n[!] Skipping queue drain (interrupted)")
+                    if not self.quiet:
+                        print("\n[!] Skipping queue drain (interrupted)")
             
             # Close CSV file if open
             try:
@@ -1995,9 +2014,9 @@ class PacketSniffer:
             except Exception:
                 pass
             
-            # Always print summary on exit
+            # Always print summary on exit (unless CLI handles it)
             try:
-                if self.packets_captured > 0:
+                if self.packets_captured > 0 and not self.quiet:
                     self._print_session_summary()
             except Exception:
                 pass
