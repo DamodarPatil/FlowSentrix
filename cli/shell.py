@@ -181,13 +181,26 @@ Usage:
         console.print(f"  [green]▸[/green] Starting capture on [bold]{self.interface}[/bold]...")
         
         try:
-            from core.sniffer import PacketSniffer
-            self.sniffer = PacketSniffer(
-                interface=self.interface,
-                db_path=self.db_path,
-                csv_file=self.csv_file,
-                on_packet=self._on_packet
-            )
+            # Try tshark backend first (Wireshark-level protocol detection)
+            from core.tshark_capture import TsharkCapture
+            if TsharkCapture.is_available():
+                self.sniffer = TsharkCapture(
+                    interface=self.interface,
+                    db_path=self.db_path,
+                    csv_file=self.csv_file,
+                    on_packet=self._on_packet
+                )
+                console.print("  [dim]  Backend: dumpcap + tshark (zero-drop Wireshark engine)[/dim]")
+            else:
+                # Fallback to Scapy sniffer
+                from core.sniffer import PacketSniffer
+                self.sniffer = PacketSniffer(
+                    interface=self.interface,
+                    db_path=self.db_path,
+                    csv_file=self.csv_file,
+                    on_packet=self._on_packet
+                )
+                console.print("  [yellow]⚠ tshark not found, using Scapy backend[/yellow]")
             
             self.capturing = True
             self.capture_start = datetime.now()

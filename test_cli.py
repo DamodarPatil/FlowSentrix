@@ -22,11 +22,16 @@ if _project_dir not in sys.path:
 
 from cli.shell import NetGuardShell
 from cli.display import console
+import re
 
 # ── Helpers ──
 PASS = 0
 FAIL = 0
 BUGS = []
+
+def strip_ansi(text):
+    """Strip ANSI escape codes from Rich output for plain text comparison."""
+    return re.sub(r'\x1b\[[0-9;]*m', '', text)
 
 def run_cmd(shell, cmd, expect_in=None, expect_not_in=None, label=None):
     """Run a shell command, capture output, and check expectations."""
@@ -40,6 +45,10 @@ def run_cmd(shell, cmd, expect_in=None, expect_not_in=None, label=None):
     old_stdout = sys.stdout
     sys.stdout = buf  # Redirect plain print output
     
+    # cmd.Cmd uses self.stdout for help output (not sys.stdout)
+    old_shell_stdout = shell.stdout
+    shell.stdout = buf
+    
     error = None
     try:
         shell.onecmd(cmd)
@@ -48,8 +57,9 @@ def run_cmd(shell, cmd, expect_in=None, expect_not_in=None, label=None):
     finally:
         console.file = old_file
         sys.stdout = old_stdout
+        shell.stdout = old_shell_stdout
     
-    output = buf.getvalue()
+    output = strip_ansi(buf.getvalue())
     
     # Check for unexpected exceptions
     if error:
@@ -116,6 +126,8 @@ print(f"  DB packets: {shell._get_db_packet_count()}")
 section("1. HELP COMMANDS")
 
 run_cmd(shell, "help", expect_in=["CAPTURE", "DISPLAY", "SEARCH", "CONFIG", "EXPORT"])
+# Note: help <cmd> uses cmd.Cmd's built-in which prints docstrings to stdout.
+# Our run_cmd captures stdout too, so these should work:
 run_cmd(shell, "help capture", expect_in=["capture start"])
 run_cmd(shell, "help show", expect_in=["show stats"])
 run_cmd(shell, "help search", expect_in=["search ip"])
@@ -366,10 +378,10 @@ if os.path.exists("/tmp/netguard_empty_test.csv"):
 
 # Test with None database
 shell._db = None
-run_cmd(shell, "show stats", expect_in=["No capture", "no database", "not available"], label="show stats (no DB connection)")
-run_cmd(shell, "show recent", expect_in=["not available", "No"], label="show recent (no DB connection)")
-run_cmd(shell, "search ip 1.1.1.1", expect_in=["not available"], label="search ip (no DB connection)")
-run_cmd(shell, "export csv /tmp/test.csv", expect_in=["not available"], label="export csv (no DB connection)")
+run_cmd(shell, "show stats", expect_in=["no database available"], label="show stats (no DB connection)")
+run_cmd(shell, "show recent", expect_in=["Database not available"], label="show recent (no DB connection)")
+run_cmd(shell, "search ip 1.1.1.1", expect_in=["Database not available"], label="search ip (no DB connection)")
+run_cmd(shell, "export csv /tmp/test.csv", expect_in=["Database not available"], label="export csv (no DB connection)")
 
 # Restore DB
 shell.db_path = old_db
