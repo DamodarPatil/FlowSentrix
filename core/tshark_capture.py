@@ -43,7 +43,9 @@ TSHARK_FIELDS = [
     'frame.len',           # 12
     'tcp.flags.str',       # 13
     'tls.handshake.extensions.supported_version',  # 14  TLS 1.3 detection
-    '_ws.col.Info',        # 15  MUST be last (may contain tab chars)
+    'eth.src',             # 15  MAC src (for ARP etc.)
+    'eth.dst',             # 16  MAC dst (for ARP etc.)
+    '_ws.col.Info',        # 17  MUST be last (may contain tab chars)
 ]
 
 FIELD_SEP = '\t'
@@ -174,16 +176,16 @@ class TsharkCapture:
         frame_len    = parts[12]
         tcp_flags    = parts[13]
         tls_sup_ver  = parts[14]  # tls.handshake.extensions.supported_version
-        ws_info      = FIELD_SEP.join(parts[15:]) if len(parts) > 15 else ''
+        eth_src      = parts[15] if len(parts) > 15 else ''
+        eth_dst      = parts[16] if len(parts) > 16 else ''
+        ws_info      = FIELD_SEP.join(parts[17:]) if len(parts) > 17 else ''
 
         src = ip4_src or ip6_src or ''
         dst = ip4_dst or ip6_dst or ''
-        # ARP and other non-IP packets: use the info string for context
-        # Don't skip them — Wireshark shows them too
+        # ARP and other non-IP packets: use MAC addresses like Wireshark
         if not src and not dst:
-            # For ARP, LLDP, STP etc. — use the ws_info to fill source/dest
-            src = 'N/A'
-            dst = 'N/A'
+            src = eth_src or 'N/A'
+            dst = eth_dst or 'N/A'
 
         src_port = tcp_sport or udp_sport or ''
         dst_port = tcp_dport or udp_dport or ''

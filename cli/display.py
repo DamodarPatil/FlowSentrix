@@ -7,7 +7,7 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
 
-console = Console()
+console = Console(emoji=False)  # Disable emoji — :cd: in MACs becomes 💿 otherwise
 
 # Protocol color map
 PROTO_COLORS = {
