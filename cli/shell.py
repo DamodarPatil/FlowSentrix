@@ -10,12 +10,16 @@ import signal
 from datetime import datetime
 
 from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
 
 from cli.banner import print_banner
 from cli.display import (
     format_packet_line, print_packet_header, print_stats_table,
     print_recent_table, print_top_talkers, print_search_results, console
 )
+from intelligence.suricata import SuricataEngine
+from intelligence.threat_intel import ThreatIntelChecker
 
 # Try readline for tab completion and history
 try:
@@ -143,6 +147,13 @@ class NetGuardShell(cmd.Cmd):
         if self._stopping:
             return
         
+        # Suricata alert — display differently
+        if '_alert' in data:
+            if self.live_display:
+                with self._batch_lock:
+                    self._display_batch.append(data)
+            return
+
         self.packet_buffer.append(data)
         if len(self.packet_buffer) > self.max_buffer:
             self.packet_buffer.pop(0)
@@ -166,8 +177,14 @@ class NetGuardShell(cmd.Cmd):
                 force_terminal=True, width=console.width
             )
             for data in batch:
-                line = format_packet_line(data)
-                temp_console.print(line, highlight=False)
+                if '_alert' in data:
+                    alert = data['_alert']
+                    engine = SuricataEngine()
+                    alert_line = engine.format_alert_line(alert)
+                    buf.write(alert_line + '\n')
+                else:
+                    line = format_packet_line(data)
+                    temp_console.print(line, highlight=False)
             output = buf.getvalue()
             if output:
                 sys.stdout.write(output)
@@ -334,9 +351,23 @@ Usage:
         
         if self.sniffer:
             self.sniffer.stop_sniffing.set()
+            # Kill the live tshark and dumpcap FIRST so the reader thread
+            # gets EOF and _process_packets() can drain and exit quickly.
+            # This prevents the race condition where join() times out and
+            # reprocess() runs while _process_packets() is still going.
+            if self.sniffer._tshark:
+                try:
+                    self.sniffer._tshark.terminate()
+                except Exception:
+                    pass
+            if self.sniffer._dumpcap:
+                try:
+                    self.sniffer._dumpcap.terminate()
+                except Exception:
+                    pass
         
         if self.capture_thread and self.capture_thread.is_alive():
-            self.capture_thread.join(timeout=5)
+            self.capture_thread.join(timeout=30)
         
         duration = ""
         if self.capture_start:
@@ -405,10 +436,12 @@ Usage:
   show recent [N]    - Show last N packets (default: 20)
   show top-talkers [N] - Most active IPs (default: 10)
   show interfaces    - Available network interfaces
-  show config        - Current configuration"""
+  show config        - Current configuration
+  show alerts [N]    - Show recent Suricata IDS alerts
+  show threats       - Threat summary (attackers, severity)"""
         parts = args.strip().split()
         if not parts:
-            console.print("  [dim]Usage: show stats | recent | top-talkers | interfaces | config[/dim]")
+            console.print("  [dim]Usage: show stats | recent | top-talkers | interfaces | config | alerts | threats[/dim]")
             return
         
         subcmd = parts[0].lower()
@@ -443,11 +476,21 @@ Usage:
             self._show_interfaces()
         elif subcmd in ('config', 'settings'):
             self._show_config()
+        elif subcmd in ('alerts', 'alert'):
+            n = 50
+            if len(parts) > 1:
+                try:
+                    n = int(parts[1])
+                except ValueError:
+                    pass
+            self._show_alerts(n)
+        elif subcmd in ('threats', 'threat'):
+            self._show_threats()
         else:
             console.print(f"  [red]Unknown: show {subcmd}[/red]")
     
     def complete_show(self, text, line, begidx, endidx):
-        options = ['stats', 'recent', 'top-talkers', 'interfaces', 'config']
+        options = ['stats', 'recent', 'top-talkers', 'interfaces', 'config', 'alerts', 'threats']
         return [o for o in options if o.startswith(text)]
     
     def _show_stats(self):
@@ -469,13 +512,16 @@ Usage:
                 duration
             )
         elif self._db:
-            # Show from database
-            stats = self._db.get_protocol_stats()
-            if stats:
-                app_counts = {s[0]: s[1] for s in stats}
-                total_pkts = sum(s[1] for s in stats)
-                total_bytes = sum(s[2] for s in stats)
-                print_stats_table({}, app_counts, {}, total_pkts, total_bytes)
+            # Show cumulative stats from ALL sessions
+            stats = self._db.get_cumulative_stats()
+            if stats['total_packets'] > 0:
+                app_counts = {s[0]: s[1] for s in stats['protocol_stats']}
+                direction = stats['direction_counts']
+                console.print(f"  [dim]Showing cumulative data from {stats['session_count']} session(s)[/dim]")
+                print_stats_table(
+                    {}, app_counts, direction,
+                    stats['total_packets'], stats['total_bytes']
+                )
             else:
                 console.print("  [dim]No data in database.[/dim]")
         else:
@@ -547,6 +593,93 @@ Usage:
         console.print(f"    Live Display:[cyan] {'on' if self.live_display else 'off'}[/cyan]")
         status = "[green]● running[/green]" if self.capturing else "[dim]○ stopped[/dim]"
         console.print(f"    Capture:     {status}")
+
+    def _show_alerts(self, limit=50):
+        """Show recent Suricata IDS alerts."""
+        self._init_db()
+        if not self._db:
+            return
+
+        alerts = self._db.get_alerts(limit)
+        if not alerts:
+            console.print("  [dim]No alerts found. Run a capture with Suricata to detect threats.[/dim]")
+            return
+
+        table = Table(title=f"🔴 Suricata IDS Alerts (last {len(alerts)})",
+                      show_lines=False, pad_edge=False)
+        table.add_column("Time", style="dim", width=19)
+        table.add_column("Sev", width=8)
+        table.add_column("Signature", min_width=30)
+        table.add_column("Source IP", width=16)
+        table.add_column("Dest", width=22)
+        table.add_column("Proto", width=6)
+
+        sev_colors = {
+            'CRITICAL': 'bold red', 'HIGH': 'red',
+            'MEDIUM': 'yellow', 'LOW': 'cyan'
+        }
+
+        for ts, severity, sig, category, src_ip, dst_ip, dst_port, proto in alerts:
+            sev_style = sev_colors.get(severity, 'dim')
+            dst_display = f"{dst_ip}:{dst_port}" if dst_port else dst_ip or ''
+
+            # Truncate timestamp for display
+            ts_display = str(ts)[:19] if ts else ''
+            # Truncate signature
+            sig_display = sig[:45] + '...' if len(sig) > 45 else sig
+
+            table.add_row(
+                ts_display,
+                f"[{sev_style}]{severity}[/{sev_style}]",
+                sig_display,
+                src_ip or '',
+                dst_display,
+                proto or '',
+            )
+
+        console.print(table)
+
+    def _show_threats(self):
+        """Show threat summary from Suricata alerts."""
+        self._init_db()
+        if not self._db:
+            return
+
+        summary = self._db.get_threat_summary()
+        if summary['total'] == 0:
+            console.print("  [dim]No threats detected yet. Run a capture to analyze traffic.[/dim]")
+            return
+
+        # Header
+        console.print(f"\n  [bold red]🛡️  Threat Summary — {summary['total']} alerts detected[/bold red]\n")
+
+        # Severity breakdown
+        sev = summary['severity_counts']
+        sev_line = "  "
+        if sev.get('CRITICAL', 0):
+            sev_line += f"[bold red]🔴 CRITICAL: {sev['CRITICAL']}[/bold red]  "
+        if sev.get('HIGH', 0):
+            sev_line += f"[red]🔴 HIGH: {sev['HIGH']}[/red]  "
+        if sev.get('MEDIUM', 0):
+            sev_line += f"[yellow]🟡 MEDIUM: {sev['MEDIUM']}[/yellow]  "
+        if sev.get('LOW', 0):
+            sev_line += f"[cyan]🔵 LOW: {sev['LOW']}[/cyan]  "
+        console.print(sev_line)
+
+        # Top attackers
+        if summary['top_attackers']:
+            console.print("\n  [bold]Top Source IPs:[/bold]")
+            for ip, count in summary['top_attackers'][:5]:
+                console.print(f"    [red]{ip}[/red] — {count} alerts")
+
+        # Top signatures
+        if summary['top_signatures']:
+            console.print("\n  [bold]Top Signatures:[/bold]")
+            for sig, count in summary['top_signatures'][:5]:
+                sig_display = sig[:60] + '...' if len(sig) > 60 else sig
+                console.print(f"    • {sig_display} — [yellow]{count}x[/yellow]")
+
+        console.print()
     
     # ── SEARCH COMMANDS ─────────────────────────────────────────
     
@@ -556,10 +689,11 @@ Usage:
 Usage:
   search ip <IP>       - Find packets by IP address
   search proto <PROTO> - Find packets by protocol
-  search port <PORT>   - Find packets by port number"""
+  search port <PORT>   - Find packets by port number
+  search threat <IP>   - Check IP reputation (AbuseIPDB)"""
         parts = args.strip().split()
         if len(parts) < 2:
-            console.print("  [dim]Usage: search ip <IP> | search proto <PROTO> | search port <PORT>[/dim]")
+            console.print("  [dim]Usage: search ip <IP> | proto <PROTO> | port <PORT> | threat <IP>[/dim]")
             return
         
         if not self._db:
@@ -604,12 +738,50 @@ Usage:
                 print_search_results(results, f"Port={port_num}")
             except Exception as e:
                 console.print(f"  [red]Search error: {e}[/red]")
+        elif subcmd == 'threat':
+            self._search_threat(value)
         else:
-            console.print(f"  [red]Unknown: search {subcmd}[/red]. Use: ip, proto, port")
+            console.print(f"  [red]Unknown: search {subcmd}[/red]. Use: ip, proto, port, threat")
     
     def complete_search(self, text, line, begidx, endidx):
-        options = ['ip', 'proto', 'port']
+        options = ['ip', 'proto', 'port', 'threat']
         return [o for o in options if o.startswith(text)]
+
+    def _search_threat(self, ip):
+        """Look up IP reputation via AbuseIPDB."""
+        checker = ThreatIntelChecker(self._db)
+        if not checker.is_configured():
+            console.print("  [yellow]⚠ No API key set. Run: set api-key <YOUR_KEY>[/yellow]")
+            console.print("  [dim]Get a free key at: https://www.abuseipdb.com/register[/dim]")
+            return
+
+        console.print(f"  [dim]Checking {ip} against AbuseIPDB...[/dim]")
+        result = checker.check_ip(ip)
+
+        if not result:
+            console.print(f"  [red]✗ Could not look up {ip}[/red]")
+            return
+
+        score = result['abuse_score']
+        country = result.get('country', '?')
+        isp = result.get('isp', 'Unknown')
+
+        # Color based on score
+        if score >= 75:
+            score_display = f"[bold red]{score}% 🔴 MALICIOUS[/bold red]"
+        elif score >= 50:
+            score_display = f"[red]{score}% ⚠️  SUSPICIOUS[/red]"
+        elif score >= 25:
+            score_display = f"[yellow]{score}% ⚡ LOW RISK[/yellow]"
+        else:
+            score_display = f"[green]{score}% ✅ CLEAN[/green]"
+
+        console.print(f"\n  [bold]🔍 Threat Intel Report: {ip}[/bold]")
+        console.print(f"    Abuse Score: {score_display}")
+        console.print(f"    Country:     [cyan]{country}[/cyan]")
+        console.print(f"    ISP:         [cyan]{isp}[/cyan]")
+        console.print(f"    Cached:      [dim]{'yes (from DB)' if result.get('last_checked') else 'fresh lookup'}[/dim]")
+        console.print()
     
     # ── SET COMMANDS ────────────────────────────────────────────
     
@@ -620,11 +792,12 @@ Usage:
   set interface <IF>   - Set capture interface
   set csv <FILE>       - Set CSV export file
   set count <N>        - Set packet count (0=unlimited)
-  set display on|off   - Toggle live packet display"""
+  set display on|off   - Toggle live packet display
+  set api-key <KEY>    - Set AbuseIPDB API key for threat intel"""
         # Use maxsplit=1 to preserve spaces in file paths (e.g. set csv /path/my file.csv)
         parts = args.strip().split(maxsplit=1)
         if len(parts) < 2:
-            console.print("  [dim]Usage: set interface|csv|count|display <value>[/dim]")
+            console.print("  [dim]Usage: set interface|csv|count|display|api-key <value>[/dim]")
             return
         
         key = parts[0].lower()
@@ -670,6 +843,11 @@ Usage:
             self.db_path = value
             self._init_db()
             console.print(f"  [green]✓[/green] Database set to: [bold]{value}[/bold]")
+        elif key == 'api-key':
+            checker = ThreatIntelChecker()
+            checker.set_api_key(value)
+            console.print(f"  [green]✓[/green] AbuseIPDB API key saved to [bold]~/.netguard/config.json[/bold]")
+            console.print(f"  [dim]  Threat intel lookups will be enabled on next capture.[/dim]")
         else:
             console.print(f"  [red]Unknown setting: {key}[/red]")
     
@@ -764,17 +942,21 @@ Usage:
         console.print("    [bold]show top-talkers[/bold] [dim][N][/dim]   Most active IPs [dim](default: 10)[/dim]")
         console.print("    [bold]show interfaces[/bold]        Available network interfaces")
         console.print("    [bold]show config[/bold]            Current configuration")
+        console.print("    [bold]show alerts[/bold] [dim][N][/dim]        Recent Suricata IDS alerts")
+        console.print("    [bold]show threats[/bold]           Threat summary [dim](attackers, severity)[/dim]")
         console.print()
         console.print("  [bold cyan]━━━ SEARCH ━━━[/bold cyan]")
         console.print("    [bold]search ip[/bold] [dim]<IP>[/dim]         Find packets by IP address")
         console.print("    [bold]search proto[/bold] [dim]<PROTO>[/dim]   Find packets by protocol")
         console.print("    [bold]search port[/bold] [dim]<PORT>[/dim]     Find packets by port")
+        console.print("    [bold]search threat[/bold] [dim]<IP>[/dim]    Check IP reputation [dim](AbuseIPDB)[/dim]")
         console.print()
         console.print("  [bold cyan]━━━ CONFIG ━━━[/bold cyan]")
         console.print("    [bold]set interface[/bold] [dim]<IF>[/dim]     Set capture interface")
         console.print("    [bold]set csv[/bold] [dim]<FILE>[/dim]         Enable CSV export")
         console.print("    [bold]set count[/bold] [dim]<N>[/dim]          Set packet count [dim](0=unlimited)[/dim]")
         console.print("    [bold]set display[/bold] [dim]on|off[/dim]     Toggle live packet display")
+        console.print("    [bold]set api-key[/bold] [dim]<KEY>[/dim]      Set AbuseIPDB API key")
         console.print()
         console.print("  [bold cyan]━━━ EXPORT ━━━[/bold cyan]")
         console.print("    [bold]export csv[/bold] [dim]<FILE>[/dim]      Export packets to CSV file")

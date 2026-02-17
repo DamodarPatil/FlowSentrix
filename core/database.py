@@ -86,6 +86,38 @@ class NetGuardDatabase:
             )
         """)
         
+        # Suricata IDS alerts table
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME NOT NULL,
+                severity TEXT NOT NULL,
+                severity_num INTEGER NOT NULL,
+                signature TEXT NOT NULL,
+                signature_id INTEGER,
+                category TEXT,
+                src_ip TEXT,
+                dst_ip TEXT,
+                src_port INTEGER,
+                dst_port INTEGER,
+                proto TEXT,
+                action TEXT DEFAULT 'allowed',
+                session_id INTEGER
+            )
+        """)
+
+        # IP reputation cache (AbuseIPDB)
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ip_reputation (
+                ip TEXT PRIMARY KEY,
+                abuse_score INTEGER DEFAULT 0,
+                country TEXT,
+                isp TEXT,
+                is_malicious BOOLEAN DEFAULT 0,
+                last_checked DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Create indexes for faster queries
         self.cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_packets_timestamp 
@@ -115,6 +147,16 @@ class NetGuardDatabase:
         self.cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_packets_direction 
             ON packets(direction)
+        """)
+
+        self.cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_alerts_timestamp 
+            ON alerts(timestamp)
+        """)
+
+        self.cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_alerts_severity 
+            ON alerts(severity_num)
         """)
         
         self.conn.commit()
@@ -250,6 +292,45 @@ class NetGuardDatabase:
         conn.close()
         
         return stats
+
+    def get_cumulative_stats(self) -> Dict:
+        """Get cumulative stats from ALL sessions in the packets table."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Protocol breakdown (prefer application_protocol, fallback to transport)
+        cursor.execute("""
+            SELECT COALESCE(application_protocol, transport_protocol) as proto,
+                   COUNT(*) as cnt, SUM(packet_length) as total_bytes
+            FROM packets
+            GROUP BY proto ORDER BY cnt DESC
+        """)
+        protocol_stats = cursor.fetchall()
+
+        # Direction counts
+        cursor.execute("""
+            SELECT direction, COUNT(*) FROM packets
+            WHERE direction IS NOT NULL
+            GROUP BY direction
+        """)
+        direction_counts = dict(cursor.fetchall())
+
+        # Totals
+        cursor.execute("SELECT COUNT(*), COALESCE(SUM(packet_length), 0) FROM packets")
+        total_pkts, total_bytes = cursor.fetchone()
+
+        # Session count
+        cursor.execute("SELECT COUNT(*) FROM sessions")
+        session_count = cursor.fetchone()[0]
+
+        conn.close()
+        return {
+            'protocol_stats': protocol_stats,  # [(proto, count, bytes), ...]
+            'direction_counts': direction_counts,
+            'total_packets': total_pkts,
+            'total_bytes': total_bytes,
+            'session_count': session_count,
+        }
     
     def get_recent_packets(self, limit: int = 100) -> List[tuple]:
         """
@@ -473,3 +554,122 @@ class NetGuardDatabase:
         
         return len(rows)
 
+    # ── Alert methods (Suricata IDS) ──────────────────────────
+
+    def insert_alert(self, alert: Dict, session_id: int = None):
+        """Insert a Suricata alert into the database."""
+        with self._lock:
+            try:
+                self.cursor.execute("""
+                    INSERT INTO alerts (timestamp, severity, severity_num, signature,
+                        signature_id, category, src_ip, dst_ip, src_port, dst_port,
+                        proto, action, session_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    alert.get('timestamp', ''),
+                    alert.get('severity', 'LOW'),
+                    alert.get('severity_num', 3),
+                    alert.get('signature', ''),
+                    alert.get('signature_id', 0),
+                    alert.get('category', ''),
+                    alert.get('src_ip', ''),
+                    alert.get('dst_ip', ''),
+                    alert.get('src_port'),
+                    alert.get('dst_port'),
+                    alert.get('proto', ''),
+                    alert.get('action', 'allowed'),
+                    session_id,
+                ))
+                self.conn.commit()
+            except Exception:
+                pass
+
+    def get_alerts(self, limit: int = 100) -> List[tuple]:
+        """Get recent alerts ordered by timestamp descending."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT timestamp, severity, signature, category,
+                   src_ip, dst_ip, dst_port, proto
+            FROM alerts
+            ORDER BY id DESC
+            LIMIT ?
+        """, (limit,))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    def get_threat_summary(self) -> Dict:
+        """Get a summary of threats: severity counts, top attackers, top signatures."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Severity counts
+        cursor.execute("SELECT severity, COUNT(*) FROM alerts GROUP BY severity")
+        severity_counts = dict(cursor.fetchall())
+
+        # Top source IPs (attackers)
+        cursor.execute("""
+            SELECT src_ip, COUNT(*) as cnt FROM alerts
+            GROUP BY src_ip ORDER BY cnt DESC LIMIT 10
+        """)
+        top_attackers = cursor.fetchall()
+
+        # Top signatures
+        cursor.execute("""
+            SELECT signature, COUNT(*) as cnt FROM alerts
+            GROUP BY signature ORDER BY cnt DESC LIMIT 10
+        """)
+        top_signatures = cursor.fetchall()
+
+        # Total
+        cursor.execute("SELECT COUNT(*) FROM alerts")
+        total = cursor.fetchone()[0]
+
+        conn.close()
+        return {
+            'total': total,
+            'severity_counts': severity_counts,
+            'top_attackers': top_attackers,
+            'top_signatures': top_signatures,
+        }
+
+    def get_alert_count(self) -> int:
+        """Get total alert count."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM alerts")
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+
+    def cache_ip_reputation(self, ip: str, abuse_score: int, country: str = '',
+                            isp: str = ''):
+        """Cache an IP reputation result from AbuseIPDB."""
+        with self._lock:
+            try:
+                self.cursor.execute("""
+                    INSERT OR REPLACE INTO ip_reputation
+                        (ip, abuse_score, country, isp, is_malicious, last_checked)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, (ip, abuse_score, country, isp, abuse_score > 50))
+                self.conn.commit()
+            except Exception:
+                pass
+
+    def get_ip_reputation(self, ip: str) -> Optional[Dict]:
+        """Get cached IP reputation, or None if not cached."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT abuse_score, country, isp, is_malicious, last_checked
+            FROM ip_reputation WHERE ip = ?
+        """, (ip,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {
+                'abuse_score': row[0], 'country': row[1], 'isp': row[2],
+                'is_malicious': bool(row[3]), 'last_checked': row[4],
+            }
+        return None

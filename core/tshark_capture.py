@@ -22,6 +22,7 @@ import time
 from datetime import datetime
 
 from core.database import NetGuardDatabase
+from intelligence.suricata import SuricataEngine
 
 
 # Protocols that are transport-layer
@@ -99,6 +100,10 @@ class TsharkCapture:
 
         # Reprocessing flag
         self._reprocessing = False
+
+        # Suricata IDS engine (Process 3)
+        self._suricata = None
+        self.alerts = []  # Live alerts for CLI access
 
         # CSV logging
         self._csv_writer = None
@@ -388,6 +393,29 @@ class TsharkCapture:
         Args:
             on_progress: callback(packets_done, total_packets) for progress display
         """
+        # Signal any still-running _process_packets() to stop immediately.
+        # This prevents the race condition where the live thread keeps
+        # incrementing packets_captured while we're resetting and recounting.
+        self._reprocessing = True
+
+        # Drain any remaining items in the queue so _process_packets()
+        # can exit its loop quickly (it checks _reprocessing AND empty queue).
+        while not self._packet_queue.empty():
+            try:
+                self._packet_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        # Put a sentinel to unblock _process_packets() if it's waiting on get()
+        try:
+            self._packet_queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+        # Give the capture thread a moment to notice and exit
+        import time
+        time.sleep(0.3)
+
         if not self.pcap_file or not os.path.exists(self.pcap_file):
             return
 
@@ -422,6 +450,10 @@ class TsharkCapture:
             self._init_csv(self.csv_file)
 
         # Build tshark -r command
+        # NOTE: Do NOT enable heuristic RTP/RTCP — they cause tshark to
+        # output duplicate lines for the same frame (up to 72x per packet).
+        # Disable TCP desegmentation — reassembly creates virtual frames that
+        # inflate packet counts by ~8%.
         tshark_cmd = [
             'tshark', '-r', self.pcap_file,
             '-l', '-n',
@@ -429,13 +461,13 @@ class TsharkCapture:
             '-E', f'separator={FIELD_SEP}',
             '-E', 'quote=n',
             '-E', 'occurrence=f',
-            '-o', 'rtp.heuristic_rtp:TRUE',
-            '-o', 'rtcp.heuristic_rtcp:TRUE',
+            '-o', 'tcp.desegment_tcp_streams:FALSE',
         ]
         for field in TSHARK_FIELDS:
             tshark_cmd.extend(['-e', field])
 
         self._reprocessing = True
+        seen_frames = set()  # Dedup safety net
         try:
             proc = subprocess.Popen(
                 tshark_cmd,
@@ -455,6 +487,12 @@ class TsharkCapture:
                 data = self._parse_line(line)
                 if data is None:
                     continue
+
+                # Deduplicate by frame number
+                frame_id = data.get('packet_id', 0)
+                if frame_id in seen_frames:
+                    continue
+                seen_frames.add(frame_id)
 
                 # Update stats
                 self.packets_captured += 1
@@ -525,6 +563,12 @@ class TsharkCapture:
         last_flush = time.time()
 
         while True:
+            # Stop immediately if reprocessing has been requested — this
+            # prevents the race where we keep incrementing packets_captured
+            # while reprocess() is also counting from the pcapng file.
+            if self._reprocessing:
+                break
+
             try:
                 line = self._packet_queue.get(timeout=0.2)
             except queue.Empty:
@@ -668,8 +712,8 @@ class TsharkCapture:
             '-E', f'separator={FIELD_SEP}',
             '-E', 'quote=n',
             '-E', 'occurrence=f',
-            '-o', 'rtp.heuristic_rtp:TRUE',
-            '-o', 'rtcp.heuristic_rtcp:TRUE',
+            '-o', 'tcp.desegment_tcp_streams:FALSE',
+            # NOTE: Do NOT enable heuristic RTP/RTCP — causes duplicate output lines
         ]
         for field in TSHARK_FIELDS:
             tshark_cmd.extend(['-e', field])
@@ -709,7 +753,22 @@ class TsharkCapture:
             )
             monitor_thread.start()
 
-            # Thread 3 (this thread): Process queue → batch DB + callbacks
+            # Process 3: Suricata IDS — independent capture for threat detection
+            if SuricataEngine.is_available():
+                self._suricata = SuricataEngine(
+                    interface=iface,
+                    log_dir='data/suricata'
+                )
+                if self._suricata.start():
+                    # Thread 3: Alert reader — tail eve.json for real-time alerts
+                    alert_thread = threading.Thread(
+                        target=self._read_suricata_alerts,
+                        name="NetGuard-AlertReader",
+                        daemon=True
+                    )
+                    alert_thread.start()
+
+            # Thread 4 (this thread): Process queue → batch DB + callbacks
             self._process_packets()
 
         except FileNotFoundError:
@@ -723,8 +782,37 @@ class TsharkCapture:
         finally:
             self._cleanup()
 
+    def _read_suricata_alerts(self):
+        """Read Suricata alerts from eve.json in real-time."""
+        if not self._suricata:
+            return
+        try:
+            for alert in self._suricata.tail_alerts():
+                self.alerts.append(alert)
+                # Store in DB
+                try:
+                    self._db.insert_alert(alert, self.session_id)
+                except Exception:
+                    pass
+                # Trigger on_packet callback with alert (for live display)
+                if self.on_packet:
+                    try:
+                        self.on_packet({'_alert': alert})
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     def _cleanup(self):
         """Clean up subprocesses and database session."""
+        # Stop Suricata IDS
+        if self._suricata:
+            try:
+                self._suricata.stop()
+            except Exception:
+                pass
+            self._suricata = None
+
         # Terminate dumpcap
         if self._dumpcap:
             try:
