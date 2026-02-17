@@ -163,32 +163,58 @@ def print_stats_table(transport_counts, application_counts, direction_counts,
         console.print(proto_table)
 
 
-def print_recent_table(packets):
-    """Print recent packets as a Rich table."""
-    table = Table(title=f"Recent Packets ({len(packets)} shown)", border_style="cyan")
-    table.add_column("#", style="dim", width=6)
-    table.add_column("Time", style="dim", width=22)
+def print_connections_table(connections):
+    """Print connections/flows as a Rich table."""
+    if not connections:
+        console.print("  [dim]No connections in database.[/dim]")
+        return
+
+    table = Table(title=f"Network Connections ({len(connections)} flows)", border_style="cyan")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Source", width=22)
+    table.add_column("Destination", width=22)
     table.add_column("Protocol", width=10)
-    table.add_column("Source", width=20)
-    table.add_column("Destination", width=20)
-    table.add_column("Len", justify="right", width=6)
-    table.add_column("Info", max_width=50)
-    
-    for pkt in packets:
-        timestamp, src, dst, protocol, size, info = pkt
+    table.add_column("Dir", width=4)
+    table.add_column("Packets", justify="right", width=9)
+    table.add_column("Bytes", justify="right", width=10)
+    table.add_column("Duration", justify="right", width=8)
+    table.add_column("State", width=8)
+
+    for i, conn in enumerate(connections, 1):
+        src_ip, dst_ip, src_port, dst_port, protocol, direction, \
+            start_time, end_time, duration, total_packets, total_bytes, state = conn
+
         color = PROTO_COLORS.get(protocol, 'white')
-        # Truncate info
-        info_display = info[:50] + "..." if len(info) > 50 else info
+
+        # Format source and destination
+        src_display = f"{src_ip}:{src_port}" if src_port else src_ip
+        dst_display = f"{dst_ip}:{dst_port}" if dst_port else dst_ip
+        if len(src_display) > 22:
+            src_display = src_display[:19] + "..."
+        if len(dst_display) > 22:
+            dst_display = dst_display[:19] + "..."
+
+        # Direction arrow
+        dir_display = "→" if direction == 'OUTGOING' else "←" if direction == 'INCOMING' else "↔"
+
+        # Format duration
+        dur_str = _format_duration(duration) if duration else "-"
+
+        # State color
+        state_style = "green" if state == "ESTABLISHED" else "yellow" if state == "ACTIVE" else "red" if state in ("RST", "FIN") else "dim"
+
         table.add_row(
-            str(size),  # placeholder, DB returns different order
-            timestamp[:22],
+            str(i),
+            src_display,
+            dst_display,
             f"[{color}]{protocol}[/]",
-            src[:20],
-            dst[:20],
-            str(size),
-            info_display
+            dir_display,
+            f"{total_packets:,}",
+            _format_bytes(total_bytes),
+            dur_str,
+            f"[{state_style}]{state}[/]",
         )
-    
+
     console.print(table)
 
 
@@ -197,48 +223,33 @@ def print_top_talkers(talkers):
     table = Table(title="Top Talkers", border_style="green")
     table.add_column("#", style="dim", width=4)
     table.add_column("IP Address", style="bold", min_width=20)
+    table.add_column("Connections", justify="right", style="dim")
     table.add_column("Packets", justify="right", style="white")
+    table.add_column("Bytes", justify="right", style="cyan")
     
-    for i, (ip, count) in enumerate(talkers, 1):
+    for i, talker in enumerate(talkers, 1):
         style = "bold green" if i <= 3 else "white"
-        table.add_row(str(i), f"[{style}]{ip}[/]", f"{count:,}")
+        if len(talker) == 4:
+            ip, connections, packets, total_bytes = talker
+            table.add_row(
+                str(i), f"[{style}]{ip}[/]",
+                f"{connections:,}", f"{packets:,}", _format_bytes(total_bytes)
+            )
+        elif len(talker) == 2:
+            ip, count = talker
+            table.add_row(str(i), f"[{style}]{ip}[/]", "-", f"{count:,}", "-")
     
     console.print(table)
 
 
-def print_search_results(packets, search_type=""):
-    """Print search results."""
-    if not packets:
-        console.print(f"  [dim]No packets found.[/dim]")
+def print_search_results(connections, search_type=""):
+    """Print search results (connection-level)."""
+    if not connections:
+        console.print(f"  [dim]No connections found.[/dim]")
         return
     
-    console.print(f"  [green]Found {len(packets)} packet(s)[/green]")
-    
-    table = Table(border_style="yellow", show_lines=False)
-    table.add_column("Time", style="dim", width=22)
-    table.add_column("Protocol", width=10)
-    table.add_column("Source", width=22)
-    table.add_column("Destination", width=22)
-    table.add_column("Size", justify="right", width=6)
-    table.add_column("Info", max_width=45)
-    
-    display_limit = min(len(packets), 100)
-    for pkt in packets[:display_limit]:
-        timestamp, src, dst, protocol, size, info = pkt
-        color = PROTO_COLORS.get(protocol, 'white')
-        info_display = info[:45] + "..." if len(info) > 45 else info
-        table.add_row(
-            timestamp[:22],
-            f"[{color}]{protocol}[/]",
-            src[:22],
-            dst[:22],
-            str(size),
-            info_display
-        )
-    
-    console.print(table)
-    if len(packets) > display_limit:
-        console.print(f"  [dim]... and {len(packets) - display_limit} more. Use 'export csv' to see all.[/dim]")
+    console.print(f"  [green]Found {len(connections)} connection(s)[/green]")
+    print_connections_table(connections)
 
 
 def _format_bytes(bytes_value):
@@ -248,3 +259,20 @@ def _format_bytes(bytes_value):
             return f"{bytes_value:.2f} {unit}"
         bytes_value /= 1024.0
     return f"{bytes_value:.2f} TB"
+
+
+def _format_duration(seconds):
+    """Format duration in seconds to human-readable string."""
+    if seconds is None or seconds == 0:
+        return "-"
+    if seconds < 1:
+        return f"{seconds*1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        mins = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{mins}m {secs}s"
+    hours = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    return f"{hours}h {mins}m"

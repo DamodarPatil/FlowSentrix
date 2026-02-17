@@ -22,6 +22,7 @@ import time
 from datetime import datetime
 
 from core.database import NetGuardDatabase
+from core.connection_tracker import ConnectionTracker
 from intelligence.suricata import SuricataEngine
 
 
@@ -100,6 +101,9 @@ class TsharkCapture:
 
         # Reprocessing flag
         self._reprocessing = False
+
+        # Connection/flow tracker (replaces per-packet DB storage)
+        self._tracker = ConnectionTracker()
 
         # Suricata IDS engine (Process 3)
         self._suricata = None
@@ -431,14 +435,9 @@ class TsharkCapture:
         self.application_counts = {}
         self.direction_counts = {'INCOMING': 0, 'OUTGOING': 0}
 
-        # Clear DB data from the live capture (will be rebuilt from pcapng)
-        try:
-            with self._db._lock:
-                self._db.cursor.execute("DELETE FROM packets")
-                self._db.cursor.execute("DELETE FROM protocol_stats")
-                self._db.conn.commit()
-        except Exception:
-            pass
+        # Clear DB and tracker for clean rebuild from pcapng
+        self._tracker.reset()
+        self._db.clear_connections()
 
         # Reset CSV if active
         if self._csv_fh:
@@ -512,18 +511,18 @@ class TsharkCapture:
                 if self._csv_writer:
                     self._log_csv(data)
 
-                # Batch for DB
-                batch.append(data)
-                if len(batch) >= BATCH_SIZE:
-                    self._batch_insert(batch)
-                    batch = []
+                # Update connection tracker
+                self._tracker.update(data)
+
+                # Update protocol_stats in DB periodically
+                if self.packets_captured % BATCH_SIZE == 0:
+                    self._flush_protocol_stats()
                     # Progress callback
                     if on_progress and total > 0:
                         on_progress(self.packets_captured, total)
 
-            # Final flush
-            if batch:
-                self._batch_insert(batch)
+            # Final flush: write all connections to DB
+            self._flush_tracker()
 
             proc.wait(timeout=10)
 
@@ -556,10 +555,8 @@ class TsharkCapture:
     # ── Thread 3: Worker — parse + batch DB + callback ───────────
 
     def _process_packets(self):
-        """Process packets from queue: parse, update stats, batch DB insert, callback."""
-        batch = []
-        BATCH_SIZE = 100
-        FLUSH_INTERVAL = 0.5  # seconds
+        """Process packets from queue: parse, update stats, track connections."""
+        FLUSH_INTERVAL = 2.0  # Flush tracker to DB every 2s
         last_flush = time.time()
 
         while True:
@@ -572,11 +569,11 @@ class TsharkCapture:
             try:
                 line = self._packet_queue.get(timeout=0.2)
             except queue.Empty:
-                # Flush partial batch on timeout
-                if batch:
-                    self._batch_insert(batch)
-                    batch = []
-                    last_flush = time.time()
+                # Periodically flush tracker to DB
+                now = time.time()
+                if (now - last_flush) >= FLUSH_INTERVAL:
+                    self._flush_tracker()
+                    last_flush = now
                 if self.stop_sniffing.is_set() and self._packet_queue.empty():
                     break
                 continue
@@ -610,54 +607,39 @@ class TsharkCapture:
             if self._csv_writer:
                 self._log_csv(data)
 
-            # Batch for DB
-            batch.append(data)
+            # Update connection tracker (in-memory, fast)
+            self._tracker.update(data)
+
+            # Periodically flush to DB
             now = time.time()
-            if len(batch) >= BATCH_SIZE or (now - last_flush) >= FLUSH_INTERVAL:
-                self._batch_insert(batch)
-                batch = []
+            if (now - last_flush) >= FLUSH_INTERVAL:
+                self._flush_tracker()
                 last_flush = now
 
         # Final flush
-        if batch:
-            self._batch_insert(batch)
+        self._flush_tracker()
 
-    def _batch_insert(self, batch):
-        """Insert a batch of packets into the database in one transaction."""
+    def _flush_tracker(self):
+        """Flush connection tracker flows to the database."""
+        flows = self._tracker.get_flows()
+        if flows:
+            self._db.flush_connections(flows, self.session_id)
+
+    def _flush_protocol_stats(self):
+        """Update protocol_stats table from current in-memory counts."""
         try:
             with self._db._lock:
-                for data in batch:
-                    self._db.cursor.execute("""
-                        INSERT INTO packets (
-                            absolute_timestamp, relative_time,
-                            src_ip, dst_ip, src_port, dst_port,
-                            transport_protocol, application_protocol, tcp_flags,
-                            direction, packet_length, info
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        data['absolute_timestamp'], data['relative_time'],
-                        data['src'], data['dst'],
-                        data.get('src_port'), data.get('dst_port'),
-                        data['transport_protocol'], data['application_protocol'],
-                        data.get('tcp_flags'), data['direction'],
-                        data['packet_length'], data['info']
-                    ))
-
-                    # Update protocol_stats
-                    proto_for_stats = data['application_protocol'] or data['transport_protocol']
+                for proto, count in self.application_counts.items():
+                    if not proto:
+                        continue
                     self._db.cursor.execute("""
                         INSERT INTO protocol_stats (protocol, packet_count, total_bytes, last_seen)
-                        VALUES (?, 1, ?, ?)
+                        VALUES (?, ?, 0, datetime('now'))
                         ON CONFLICT(protocol) DO UPDATE SET
-                            packet_count = packet_count + 1,
-                            total_bytes = total_bytes + ?,
-                            last_seen = ?
-                    """, (
-                        proto_for_stats, data['packet_length'], data['absolute_timestamp'],
-                        data['packet_length'], data['absolute_timestamp']
-                    ))
-
-                self._db.conn.commit()  # Single commit for entire batch
+                            packet_count = ?,
+                            last_seen = datetime('now')
+                    """, (proto, count, count))
+                self._db.conn.commit()
         except Exception:
             pass  # Don't crash capture on DB errors
 

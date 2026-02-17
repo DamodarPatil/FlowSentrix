@@ -1,6 +1,16 @@
 """
 NetGuard Database Module
-SQLite-based storage for efficient packet capture analysis.
+SQLite-based storage for connection/flow-level network analysis.
+
+Architecture:
+  - connections table: One row per flow (5-tuple), not per packet
+  - protocol_stats table: Aggregate protocol counters
+  - sessions table: Capture session metadata
+  - alerts table: Suricata IDS alerts
+  - ip_reputation table: AbuseIPDB cache
+
+The raw pcapng file is the ground truth for individual packets.
+This DB stores aggregated summaries for fast querying.
 """
 import sqlite3
 import os
@@ -11,8 +21,8 @@ from typing import Dict, Optional, List
 
 class NetGuardDatabase:
     """
-    Manages SQLite database for packet storage and querying.
-    Much better than CSV for production use!
+    Manages SQLite database for connection-level network analysis.
+    Stores flow summaries instead of individual packets.
     """
     
     def __init__(self, db_path="data/netguard.db"):
@@ -41,24 +51,26 @@ class NetGuardDatabase:
     
     def _init_database(self):
         """Create tables and indexes if they don't exist."""
-        # Main packets table - Enhanced with Wireshark-inspired fields
-        # Using AUTOINCREMENT to avoid ID conflicts across sessions
+        # Connection/flow table — one row per 5-tuple flow
+        # This is how real enterprise monitors (Zeek, ntopng) store data
         self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS packets (
-                packet_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                absolute_timestamp DATETIME NOT NULL,
-                relative_time REAL,
+            CREATE TABLE IF NOT EXISTS connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 src_ip TEXT NOT NULL,
                 dst_ip TEXT NOT NULL,
                 src_port INTEGER,
                 dst_port INTEGER,
-                transport_protocol TEXT NOT NULL,
-                application_protocol TEXT,
-                tcp_flags TEXT,
+                protocol TEXT NOT NULL,
+                transport TEXT NOT NULL,
                 direction TEXT,
-                packet_length INTEGER NOT NULL,
-                info TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                start_time DATETIME NOT NULL,
+                end_time DATETIME,
+                duration REAL DEFAULT 0,
+                total_packets INTEGER DEFAULT 1,
+                total_bytes INTEGER DEFAULT 0,
+                state TEXT DEFAULT 'ACTIVE',
+                session_id INTEGER,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
             )
         """)
         
@@ -118,35 +130,35 @@ class NetGuardDatabase:
             )
         """)
 
-        # Create indexes for faster queries
+        # Create indexes for connections table
         self.cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_packets_timestamp 
-            ON packets(absolute_timestamp)
+            CREATE INDEX IF NOT EXISTS idx_connections_src_ip 
+            ON connections(src_ip)
         """)
         
         self.cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_packets_transport_protocol 
-            ON packets(transport_protocol)
+            CREATE INDEX IF NOT EXISTS idx_connections_dst_ip 
+            ON connections(dst_ip)
         """)
-        
+
         self.cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_packets_application_protocol 
-            ON packets(application_protocol)
+            CREATE INDEX IF NOT EXISTS idx_connections_protocol 
+            ON connections(protocol)
         """)
-        
+
         self.cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_packets_src_ip 
-            ON packets(src_ip)
+            CREATE INDEX IF NOT EXISTS idx_connections_start_time 
+            ON connections(start_time)
         """)
-        
+
         self.cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_packets_dst_ip 
-            ON packets(dst_ip)
+            CREATE INDEX IF NOT EXISTS idx_connections_bytes 
+            ON connections(total_bytes)
         """)
-        
+
         self.cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_packets_direction 
-            ON packets(direction)
+            CREATE INDEX IF NOT EXISTS idx_connections_direction 
+            ON connections(direction)
         """)
 
         self.cursor.execute("""
@@ -159,8 +171,19 @@ class NetGuardDatabase:
             ON alerts(severity_num)
         """)
         
+        # Drop legacy packets table if it exists (data lives in pcapng now)
+        self.cursor.execute("DROP TABLE IF EXISTS packets")
+
+        # Drop legacy packet indexes
+        for idx in ['idx_packets_timestamp', 'idx_packets_transport_protocol',
+                     'idx_packets_application_protocol', 'idx_packets_src_ip',
+                     'idx_packets_dst_ip', 'idx_packets_direction']:
+            self.cursor.execute(f"DROP INDEX IF EXISTS {idx}")
+        
         self.conn.commit()
-    
+
+    # ── Session management ──────────────────────────────────────
+
     def start_session(self, interface: Optional[str] = None) -> int:
         """
         Start a new capture session.
@@ -202,76 +225,79 @@ class NetGuardDatabase:
             """, (datetime.now(), total_packets, total_bytes, session_id))
             
             self.conn.commit()
-    
-    def insert_packet(self, packet_data: Dict):
-        """
-        Insert a packet into the database with enhanced fields.
+
+    # ── Connection/flow storage ─────────────────────────────────
+
+    def flush_connections(self, flows: list, session_id: int = None):
+        """Bulk insert connection/flow summaries from the tracker.
         
         Args:
-            packet_data: Dictionary containing packet information
+            flows: List of flow dicts from ConnectionTracker.get_flows()
+            session_id: Current capture session ID
         """
         with self._lock:
-            # Let SQLite auto-generate packet_id via AUTOINCREMENT
-            self.cursor.execute("""
-                INSERT INTO packets (
-                    absolute_timestamp, relative_time,
-                    src_ip, dst_ip, src_port, dst_port,
-                    transport_protocol, application_protocol, tcp_flags,
-                    direction, packet_length, info
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                packet_data['absolute_timestamp'],
-                packet_data['relative_time'],
-                packet_data['src'],  # Full IP address
-                packet_data['dst'],  # Full IP address
-                packet_data.get('src_port'),
-                packet_data.get('dst_port'),
-                packet_data['transport_protocol'],
-                packet_data['application_protocol'],
-                packet_data.get('tcp_flags'),
-                packet_data['direction'],
-                packet_data['packet_length'],
-                packet_data['info']
-            ))
-            
-            # Update protocol statistics (use application protocol if available, else transport)
-            protocol_for_stats = packet_data['application_protocol'] or packet_data['transport_protocol']
-            self.cursor.execute("""
-                INSERT INTO protocol_stats (protocol, packet_count, total_bytes, last_seen)
-                VALUES (?, 1, ?, ?)
-                ON CONFLICT(protocol) DO UPDATE SET
-                    packet_count = packet_count + 1,
-                    total_bytes = total_bytes + ?,
-                    last_seen = ?
-            """, (
-                protocol_for_stats,
-                packet_data['packet_length'],
-                packet_data['absolute_timestamp'],
-                packet_data['packet_length'],
-                packet_data['absolute_timestamp']
-            ))
-            
+            try:
+                for flow in flows:
+                    self.cursor.execute("""
+                        INSERT INTO connections (
+                            src_ip, dst_ip, src_port, dst_port,
+                            protocol, transport, direction,
+                            start_time, end_time, duration,
+                            total_packets, total_bytes, state, session_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        flow['src_ip'], flow['dst_ip'],
+                        flow.get('src_port'), flow.get('dst_port'),
+                        flow['protocol'], flow['transport'],
+                        flow.get('direction', ''),
+                        flow['start_time'], flow['end_time'],
+                        flow.get('duration', 0),
+                        flow['total_packets'], flow['total_bytes'],
+                        flow.get('state', 'ACTIVE'),
+                        session_id,
+                    ))
+                self.conn.commit()
+            except Exception:
+                pass  # Don't crash capture on DB errors
+
+    def clear_connections(self):
+        """Clear all connections (called before reprocessing)."""
+        with self._lock:
+            self.cursor.execute("DELETE FROM connections")
+            self.cursor.execute("DELETE FROM protocol_stats")
             self.conn.commit()
-    
+
+    # ── Query methods ───────────────────────────────────────────
+
     def close(self):
         """Close the database connection."""
         with self._lock:
             if self.conn:
                 self.conn.close()
                 self.conn = None
-    
+
     def get_packet_count(self) -> int:
-        """Get total number of packets in database."""
+        """Get total packet count (sum across all connections)."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute("SELECT COUNT(*) FROM packets")
+        cursor.execute("SELECT COALESCE(SUM(total_packets), 0) FROM connections")
         count = cursor.fetchone()[0]
         
         conn.close()
         return count
     
+    def get_connection_count(self) -> int:
+        """Get total number of connections/flows."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM connections")
+        count = cursor.fetchone()[0]
+        
+        conn.close()
+        return count
+
     def get_protocol_stats(self) -> List[tuple]:
         """
         Get protocol statistics.
@@ -294,34 +320,40 @@ class NetGuardDatabase:
         return stats
 
     def get_cumulative_stats(self) -> Dict:
-        """Get cumulative stats from ALL sessions in the packets table."""
+        """Get cumulative stats from all connections."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        # Protocol breakdown (prefer application_protocol, fallback to transport)
+        # Protocol breakdown from connections
         cursor.execute("""
-            SELECT COALESCE(application_protocol, transport_protocol) as proto,
-                   COUNT(*) as cnt, SUM(packet_length) as total_bytes
-            FROM packets
-            GROUP BY proto ORDER BY cnt DESC
+            SELECT protocol, SUM(total_packets) as cnt, SUM(total_bytes) as bytes
+            FROM connections
+            GROUP BY protocol ORDER BY cnt DESC
         """)
         protocol_stats = cursor.fetchall()
 
         # Direction counts
         cursor.execute("""
-            SELECT direction, COUNT(*) FROM packets
-            WHERE direction IS NOT NULL
+            SELECT direction, SUM(total_packets) FROM connections
+            WHERE direction IS NOT NULL AND direction != ''
             GROUP BY direction
         """)
         direction_counts = dict(cursor.fetchall())
 
         # Totals
-        cursor.execute("SELECT COUNT(*), COALESCE(SUM(packet_length), 0) FROM packets")
+        cursor.execute("""
+            SELECT COALESCE(SUM(total_packets), 0), COALESCE(SUM(total_bytes), 0)
+            FROM connections
+        """)
         total_pkts, total_bytes = cursor.fetchone()
 
         # Session count
         cursor.execute("SELECT COUNT(*) FROM sessions")
         session_count = cursor.fetchone()[0]
+
+        # Connection count
+        cursor.execute("SELECT COUNT(*) FROM connections")
+        connection_count = cursor.fetchone()[0]
 
         conn.close()
         return {
@@ -330,106 +362,151 @@ class NetGuardDatabase:
             'total_packets': total_pkts,
             'total_bytes': total_bytes,
             'session_count': session_count,
+            'connection_count': connection_count,
         }
-    
-    def get_recent_packets(self, limit: int = 100) -> List[tuple]:
+
+    def get_connections(self, limit: int = 50, order_by: str = 'total_bytes') -> List[tuple]:
         """
-        Get most recent packets.
+        Get connections ordered by the specified column.
         
         Args:
-            limit: Maximum number of packets to return
+            limit: Maximum number of connections to return
+            order_by: Column to sort by (total_bytes, total_packets, duration, start_time)
             
         Returns:
-            List of tuples containing packet data
+            List of tuples with connection data
         """
+        # Whitelist allowed order columns
+        allowed = {'total_bytes', 'total_packets', 'duration', 'start_time'}
+        if order_by not in allowed:
+            order_by = 'total_bytes'
+        
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute("""
-            SELECT absolute_timestamp, src_ip, dst_ip, 
-                   application_protocol, packet_length, info
-            FROM packets
-            ORDER BY packet_id DESC
+        cursor.execute(f"""
+            SELECT src_ip, dst_ip, src_port, dst_port,
+                   protocol, direction, start_time, end_time,
+                   duration, total_packets, total_bytes, state
+            FROM connections
+            ORDER BY {order_by} DESC
             LIMIT ?
         """, (limit,))
         
-        packets = cursor.fetchall()
+        rows = cursor.fetchall()
         conn.close()
         
-        return packets
-    
+        return rows
+
     def search_by_ip(self, ip_address: str) -> List[tuple]:
         """
-        Search packets by IP address (source or destination).
+        Search connections involving an IP address.
         
         Args:
             ip_address: IP address to search for
             
         Returns:
-            List of matching packets
+            List of matching connections
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT absolute_timestamp, src_ip, dst_ip, 
-                   application_protocol, packet_length, info
-            FROM packets
+            SELECT src_ip, dst_ip, src_port, dst_port,
+                   protocol, direction, start_time, end_time,
+                   duration, total_packets, total_bytes, state
+            FROM connections
             WHERE src_ip = ? OR dst_ip = ?
-            ORDER BY absolute_timestamp DESC
-            LIMIT 1000
+            ORDER BY total_bytes DESC
+            LIMIT 100
         """, (ip_address, ip_address))
         
-        packets = cursor.fetchall()
+        rows = cursor.fetchall()
         conn.close()
         
-        return packets
+        return rows
     
     def search_by_protocol(self, protocol: str) -> List[tuple]:
         """
-        Search packets by protocol (searches both transport and application).
+        Search connections by protocol.
         
         Args:
-            protocol: Protocol name (TCP, UDP, DNS, HTTPS, etc.)
+            protocol: Protocol name (TCP, QUIC, DNS, TLSv1.3, etc.)
             
         Returns:
-            List of matching packets
+            List of matching connections
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT absolute_timestamp, src_ip, dst_ip, 
-                   application_protocol, packet_length, info
-            FROM packets
-            WHERE UPPER(transport_protocol) = UPPER(?) OR UPPER(application_protocol) = UPPER(?)
-            ORDER BY absolute_timestamp DESC
-            LIMIT 1000
+            SELECT src_ip, dst_ip, src_port, dst_port,
+                   protocol, direction, start_time, end_time,
+                   duration, total_packets, total_bytes, state
+            FROM connections
+            WHERE UPPER(protocol) = UPPER(?) OR UPPER(transport) = UPPER(?)
+            ORDER BY total_bytes DESC
+            LIMIT 100
         """, (protocol, protocol))
         
-        packets = cursor.fetchall()
+        rows = cursor.fetchall()
         conn.close()
         
-        return packets
+        return rows
+
+    def search_by_port(self, port: int) -> List[tuple]:
+        """
+        Search connections by port number.
+        
+        Args:
+            port: Port number to search for
+            
+        Returns:
+            List of matching connections
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT src_ip, dst_ip, src_port, dst_port,
+                   protocol, direction, start_time, end_time,
+                   duration, total_packets, total_bytes, state
+            FROM connections
+            WHERE src_port = ? OR dst_port = ?
+            ORDER BY total_bytes DESC
+            LIMIT 100
+        """, (port, port))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return rows
     
     def get_top_talkers(self, limit: int = 10) -> List[tuple]:
         """
-        Get most active IP addresses.
+        Get most active IP addresses by total bytes transferred.
         
         Args:
             limit: Number of top IPs to return
             
         Returns:
-            List of tuples: (ip, packet_count)
+            List of tuples: (ip, total_connections, total_packets, total_bytes)
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
+        # Combine src and dst IPs, aggregate
         cursor.execute("""
-            SELECT src_ip as ip, COUNT(*) as count
-            FROM packets
-            GROUP BY src_ip
-            ORDER BY count DESC
+            SELECT ip, COUNT(*) as connections, 
+                   SUM(packets) as total_packets,
+                   SUM(bytes) as total_bytes
+            FROM (
+                SELECT src_ip as ip, total_packets as packets, total_bytes as bytes FROM connections
+                UNION ALL
+                SELECT dst_ip as ip, total_packets as packets, total_bytes as bytes FROM connections
+            )
+            GROUP BY ip
+            ORDER BY total_bytes DESC
             LIMIT ?
         """, (limit,))
         
@@ -454,17 +531,17 @@ class NetGuardDatabase:
     
     def clear_old_data(self, days: int = 30):
         """
-        Delete packets older than specified days.
+        Delete connections older than specified days.
         
         Args:
-            days: Delete packets older than this many days
+            days: Delete connections older than this many days
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         cursor.execute("""
-            DELETE FROM packets
-            WHERE absolute_timestamp < datetime('now', '-' || ? || ' days')
+            DELETE FROM connections
+            WHERE start_time < datetime('now', '-' || ? || ' days')
         """, (days,))
         
         deleted = cursor.rowcount
@@ -473,49 +550,48 @@ class NetGuardDatabase:
         
         return deleted
     
-    def delete_packets_by_date(self, date_str: str) -> int:
+    def delete_connections_by_date(self, date_str: str) -> int:
         """
-        Delete packets for a specific date.
+        Delete connections for a specific date.
 
         Args:
             date_str: Date string in YYYY-MM-DD format
             
         Returns:
-            Number of deleted packets
+            Number of deleted connections
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # SQLite's date() function extracts the date part from the timestamp
         cursor.execute("""
-            DELETE FROM packets
-            WHERE date(absolute_timestamp) = ?
+            DELETE FROM connections
+            WHERE date(start_time) = ?
         """, (date_str,))
         
         deleted = cursor.rowcount
         
-        # Recalculate protocol_stats from remaining packets
+        # Recalculate protocol_stats from remaining connections
         if deleted > 0:
             cursor.execute("DELETE FROM protocol_stats")
             cursor.execute("""
                 INSERT INTO protocol_stats (protocol, packet_count, total_bytes, last_seen)
                 SELECT 
-                    COALESCE(application_protocol, transport_protocol) as protocol,
-                    COUNT(*) as packet_count,
-                    SUM(packet_length) as total_bytes,
-                    MAX(absolute_timestamp) as last_seen
-                FROM packets
-                GROUP BY COALESCE(application_protocol, transport_protocol)
+                    protocol,
+                    SUM(total_packets) as packet_count,
+                    SUM(total_bytes) as total_bytes,
+                    MAX(end_time) as last_seen
+                FROM connections
+                GROUP BY protocol
             """)
         
         conn.commit()
         conn.close()
         
         return deleted
-    
+
     def export_to_csv(self, output_file: str, limit: Optional[int] = None):
         """
-        Export database to CSV file with all enhanced fields.
+        Export connections to CSV file.
         
         Args:
             output_file: Path to output CSV file
@@ -527,12 +603,12 @@ class NetGuardDatabase:
         cursor = conn.cursor()
         
         query = """
-            SELECT packet_id, absolute_timestamp, relative_time,
-                   src_ip, dst_ip, src_port, dst_port,
-                   transport_protocol, application_protocol, tcp_flags,
-                   direction, packet_length, info
-            FROM packets 
-            ORDER BY packet_id ASC
+            SELECT id, src_ip, dst_ip, src_port, dst_port,
+                   protocol, transport, direction,
+                   start_time, end_time, duration,
+                   total_packets, total_bytes, state
+            FROM connections 
+            ORDER BY total_bytes DESC
         """
         if limit:
             query += f" LIMIT {limit}"
@@ -543,10 +619,11 @@ class NetGuardDatabase:
         with open(output_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                'Packet_ID', 'Absolute_Timestamp', 'Relative_Time',
-                'Source_IP', 'Destination_IP', 'Source_Port', 'Destination_Port',
-                'Transport_Protocol', 'Application_Protocol', 'TCP_Flags',
-                'Direction', 'Packet_Length', 'Info'
+                'Connection_ID', 'Source_IP', 'Destination_IP',
+                'Source_Port', 'Destination_Port',
+                'Protocol', 'Transport', 'Direction',
+                'Start_Time', 'End_Time', 'Duration_Seconds',
+                'Total_Packets', 'Total_Bytes', 'State'
             ])
             writer.writerows(rows)
         

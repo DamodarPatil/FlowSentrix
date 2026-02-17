@@ -16,7 +16,7 @@ from rich.panel import Panel
 from cli.banner import print_banner
 from cli.display import (
     format_packet_line, print_packet_header, print_stats_table,
-    print_recent_table, print_top_talkers, print_search_results, console
+    print_connections_table, print_top_talkers, print_search_results, console
 )
 from intelligence.suricata import SuricataEngine
 from intelligence.threat_intel import ThreatIntelChecker
@@ -432,35 +432,23 @@ Usage:
         """Show various information.
         
 Usage:
-  show stats         - Protocol breakdown & session stats
-  show recent [N]    - Show last N packets (default: 20)
+  show stats           - Protocol breakdown & session stats
+  show connections [N] - Show top N connections/flows (default: 20)
   show top-talkers [N] - Most active IPs (default: 10)
-  show interfaces    - Available network interfaces
-  show config        - Current configuration
-  show alerts [N]    - Show recent Suricata IDS alerts
-  show threats       - Threat summary (attackers, severity)"""
+  show interfaces      - Available network interfaces
+  show config          - Current configuration
+  show alerts [N]      - Show recent Suricata IDS alerts
+  show threats         - Threat summary (attackers, severity)"""
         parts = args.strip().split()
         if not parts:
-            console.print("  [dim]Usage: show stats | recent | top-talkers | interfaces | config | alerts | threats[/dim]")
+            console.print("  [dim]Usage: show stats | connections | top-talkers | interfaces | config | alerts | threats[/dim]")
             return
         
         subcmd = parts[0].lower()
         
         if subcmd == 'stats':
             self._show_stats()
-        elif subcmd == 'recent':
-            n = 20
-            if len(parts) > 1:
-                try:
-                    n = int(parts[1])
-                    if n <= 0:
-                        console.print("  [red]✗ Count must be a positive number.[/red]")
-                        return
-                except ValueError:
-                    console.print(f"  [red]✗ Invalid number: {parts[1]}[/red]")
-                    return
-            self._show_recent(n)
-        elif subcmd in ('top-talkers', 'talkers'):
+        elif subcmd in ('recent', 'connections', 'conn', 'flows', 'flow'):
             n = 10
             if len(parts) > 1:
                 try:
@@ -490,7 +478,7 @@ Usage:
             console.print(f"  [red]Unknown: show {subcmd}[/red]")
     
     def complete_show(self, text, line, begidx, endidx):
-        options = ['stats', 'recent', 'top-talkers', 'interfaces', 'config', 'alerts', 'threats']
+        options = ['stats', 'connections', 'top-talkers', 'interfaces', 'config', 'alerts', 'threats']
         return [o for o in options if o.startswith(text)]
     
     def _show_stats(self):
@@ -527,14 +515,14 @@ Usage:
         else:
             console.print("  [dim]No capture running and no database available.[/dim]")
     
-    def _show_recent(self, limit=20):
-        """Show recent packets."""
+    def _show_connections(self, limit=20):
+        """Show connections/flows."""
         if self._db:
-            packets = self._db.get_recent_packets(limit)
-            if packets:
-                print_recent_table(packets)
+            connections = self._db.get_connections(limit)
+            if connections:
+                print_connections_table(connections)
             else:
-                console.print("  [dim]No packets in database.[/dim]")
+                console.print("  [dim]No connections in database.[/dim]")
         else:
             console.print("  [dim]Database not available.[/dim]")
     
@@ -721,23 +709,8 @@ Usage:
                 console.print(f"  [red]✗ Invalid port number: {value}[/red]")
                 return
             console.print(f"  [bold]Searching for port: {port_num}[/bold]")
-            # Port search via SQL
-            try:
-                import sqlite3
-                conn = sqlite3.connect(self.db_path)
-                cursor = conn.execute("""
-                    SELECT absolute_timestamp, src_ip, dst_ip,
-                           COALESCE(application_protocol, transport_protocol),
-                           packet_length, info
-                    FROM packets
-                    WHERE src_port = ? OR dst_port = ?
-                    ORDER BY packet_id DESC LIMIT 200
-                """, (port_num, port_num))
-                results = cursor.fetchall()
-                conn.close()
-                print_search_results(results, f"Port={port_num}")
-            except Exception as e:
-                console.print(f"  [red]Search error: {e}[/red]")
+            results = self._db.search_by_port(port_num)
+            print_search_results(results, f"Port={port_num}")
         elif subcmd == 'threat':
             self._search_threat(value)
         else:
@@ -878,18 +851,25 @@ Usage:
         """Export captured data.
         
 Usage:
-  export csv <filename> - Export packets to CSV file"""
+  export csv [filename] - Export connections to CSV file (auto-names if omitted)"""
         parts = args.strip().split()
-        if len(parts) < 2:
-            console.print("  [dim]Usage: export csv <filename>[/dim]")
+        if not parts:
+            console.print("  [dim]Usage: export csv [filename][/dim]")
             return
         
         if parts[0].lower() == 'csv':
-            filename = parts[1]
+            if len(parts) >= 2:
+                filename = parts[1]
+            else:
+                # Auto-generate filename with timestamp
+                filename = f"netguard_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            # Auto-append .csv if not present
+            if not filename.lower().endswith('.csv'):
+                filename += '.csv'
             if self._db:
                 try:
                     count = self._db.export_to_csv(filename)
-                    console.print(f"  [green]✓[/green] Exported [bold]{count:,}[/bold] packets to [bold]{filename}[/bold]")
+                    console.print(f"  [green]✓[/green] Exported [bold]{count:,}[/bold] connections to [bold]{filename}[/bold]")
                 except Exception as e:
                     console.print(f"  [red]✗ Export failed: {e}[/red]")
             else:
@@ -938,7 +918,7 @@ Usage:
         console.print()
         console.print("  [bold cyan]━━━ DISPLAY ━━━[/bold cyan]")
         console.print("    [bold]show stats[/bold]             Protocol breakdown & session stats")
-        console.print("    [bold]show recent[/bold] [dim][N][/dim]        Show last N packets [dim](default: 20)[/dim]")
+        console.print("    [bold]show connections[/bold] [dim][N][/dim]   Show top N connections/flows [dim](default: 20)[/dim]")
         console.print("    [bold]show top-talkers[/bold] [dim][N][/dim]   Most active IPs [dim](default: 10)[/dim]")
         console.print("    [bold]show interfaces[/bold]        Available network interfaces")
         console.print("    [bold]show config[/bold]            Current configuration")
@@ -946,9 +926,9 @@ Usage:
         console.print("    [bold]show threats[/bold]           Threat summary [dim](attackers, severity)[/dim]")
         console.print()
         console.print("  [bold cyan]━━━ SEARCH ━━━[/bold cyan]")
-        console.print("    [bold]search ip[/bold] [dim]<IP>[/dim]         Find packets by IP address")
-        console.print("    [bold]search proto[/bold] [dim]<PROTO>[/dim]   Find packets by protocol")
-        console.print("    [bold]search port[/bold] [dim]<PORT>[/dim]     Find packets by port")
+        console.print("    [bold]search ip[/bold] [dim]<IP>[/dim]         Find connections by IP address")
+        console.print("    [bold]search proto[/bold] [dim]<PROTO>[/dim]   Find connections by protocol")
+        console.print("    [bold]search port[/bold] [dim]<PORT>[/dim]     Find connections by port")
         console.print("    [bold]search threat[/bold] [dim]<IP>[/dim]    Check IP reputation [dim](AbuseIPDB)[/dim]")
         console.print()
         console.print("  [bold cyan]━━━ CONFIG ━━━[/bold cyan]")
@@ -959,7 +939,7 @@ Usage:
         console.print("    [bold]set api-key[/bold] [dim]<KEY>[/dim]      Set AbuseIPDB API key")
         console.print()
         console.print("  [bold cyan]━━━ EXPORT ━━━[/bold cyan]")
-        console.print("    [bold]export csv[/bold] [dim]<FILE>[/dim]      Export packets to CSV file")
+        console.print("    [bold]export csv[/bold] [dim][FILE][/dim]      Export connections to CSV [dim](auto-names if omitted)[/dim]")
         console.print()
         console.print("  [bold cyan]━━━ OTHER ━━━[/bold cyan]")
         console.print("    [bold]clear[/bold]                  Clear screen")
