@@ -67,11 +67,13 @@ class BehaviorEngine:
         """
         self._db = db
 
-    def analyze(self, flows: List[dict]) -> Dict[str, List[Tuple[str, str, str]]]:
+    def analyze(self, flows: List[dict], ip_to_domain: Dict[str, str] = None) -> Dict[str, List[Tuple[str, str, str]]]:
         """Run all detectors on a batch of flows.
 
         Args:
             flows: List of flow dicts from ConnectionTracker.get_flows()
+            ip_to_domain: Optional IP→domain mapping from DNS responses
+                          (enables CDN-aware beaconing detection)
 
         Returns:
             Dict mapping flow index → [(tag, severity, reason), ...]
@@ -83,12 +85,13 @@ class BehaviorEngine:
         all_tags: Dict[int, List[Tuple[str, str, str]]] = {}
 
         # Run each detector
-        for detector in [
-            self._detect_beaconing,
+        detectors = [
+            lambda f: self._detect_beaconing(f, ip_to_domain or {}),
             self._detect_data_exfil,
             self._detect_new_destination,
             self._detect_traffic_anomaly,
-        ]:
+        ]
+        for detector in detectors:
             results = detector(flows)
             for idx, tag, severity, reason in results:
                 if idx not in all_tags:
@@ -97,22 +100,32 @@ class BehaviorEngine:
 
         return all_tags
 
-    def _detect_beaconing(self, flows: List[dict]) -> List[Tuple[int, str, str, str]]:
+    def _detect_beaconing(self, flows: List[dict], ip_to_domain: Dict[str, str] = None) -> List[Tuple[int, str, str, str]]:
         """Detect periodic C2-style beaconing.
 
-        Groups flows by (src_ip, dst_ip) pair. If the same pair has
-        N+ connections with regular time intervals (low coefficient of
-        variation), flags as beaconing.
+        Groups flows by (src_ip, destination) pair. The destination is resolved
+        to a domain name via DNS lookups when available, so that CDN-rotated IPs
+        (e.g., Cloudflare serving example.com from multiple IPs) are grouped
+        together. Falls back to raw dst_ip when no DNS mapping exists.
+
+        Also deduplicates flows that start within 1 second of each other to
+        the same destination (handles TCP + TLS being tracked as separate flows).
 
         Returns:
             List of (flow_index, 'beaconing', severity, reason)
         """
         results = []
+        if ip_to_domain is None:
+            ip_to_domain = {}
 
-        # Group flows by src→dst pair
+        # Group flows by src → destination (domain or IP)
         pairs: Dict[tuple, List[Tuple[int, dict]]] = {}
         for i, flow in enumerate(flows):
-            key = (flow.get('src_ip', ''), flow.get('dst_ip', ''))
+            src = flow.get('src_ip', '')
+            dst_ip = flow.get('dst_ip', '')
+            # Resolve dst_ip to domain if known (CDN-aware grouping)
+            dst_key = ip_to_domain.get(dst_ip, dst_ip)
+            key = (src, dst_key)
             if key not in pairs:
                 pairs[key] = []
             pairs[key].append((i, flow))
@@ -121,8 +134,7 @@ class BehaviorEngine:
             if len(group) < BEACON_MIN_CONNECTIONS:
                 continue
 
-            # Skip private-to-private? No — internal C2 is also suspicious
-            # But skip multicast/broadcast
+            # Skip multicast/broadcast
             if dst.startswith('ff') or dst.startswith('224.') or dst.startswith('239.'):
                 continue
 
@@ -140,10 +152,20 @@ class BehaviorEngine:
 
             times.sort(key=lambda x: x[0])
 
+            # Deduplicate flows starting within 1 second of each other
+            # (handles TCP handshake + TLS data being separate flows)
+            deduped = [times[0]]
+            for j in range(1, len(times)):
+                if (times[j][0] - deduped[-1][0]).total_seconds() > 1.0:
+                    deduped.append(times[j])
+
+            if len(deduped) < BEACON_MIN_CONNECTIONS:
+                continue
+
             # Compute inter-connection intervals (seconds)
             intervals = []
-            for j in range(1, len(times)):
-                delta = (times[j][0] - times[j - 1][0]).total_seconds()
+            for j in range(1, len(deduped)):
+                delta = (deduped[j][0] - deduped[j - 1][0]).total_seconds()
                 if delta > 0:
                     intervals.append(delta)
 
@@ -159,8 +181,10 @@ class BehaviorEngine:
             cv = stdev / mean if mean > 0 else float('inf')
 
             if cv < BEACON_CV_THRESHOLD:
+                # Use domain name in reason if available
+                display_dst = dst
                 reason = (
-                    f"{len(group)} connections to {dst}, "
+                    f"{len(deduped)} connections to {display_dst}, "
                     f"interval ~{mean:.1f}s (CV={cv:.3f})"
                 )
                 # Tag all flows in this group
@@ -172,32 +196,44 @@ class BehaviorEngine:
     def _detect_data_exfil(self, flows: List[dict]) -> List[Tuple[int, str, str, str]]:
         """Detect large outbound data transfers.
 
-        Flags outgoing connections with high byte counts to non-private IPs.
+        Aggregates outbound bytes per destination IP across all flows,
+        then flags if the total exceeds the threshold. This catches
+        split uploads (e.g., 60 MB across 30 × 2 MB connections).
 
         Returns:
             List of (flow_index, 'data_exfil', severity, reason)
         """
         results = []
 
+        # Aggregate outbound bytes per destination
+        dst_bytes: Dict[str, int] = {}
+        dst_flows: Dict[str, List[int]] = {}
+
         for i, flow in enumerate(flows):
-            direction = flow.get('direction', '')
-            if direction != 'OUTGOING':
+            if flow.get('direction', '') != 'OUTGOING':
                 continue
 
             dst_ip = flow.get('dst_ip', '')
             if _is_private(dst_ip):
                 continue
 
-            total_bytes = flow.get('total_bytes', 0)
+            dst_bytes[dst_ip] = dst_bytes.get(dst_ip, 0) + flow.get('total_bytes', 0)
+            if dst_ip not in dst_flows:
+                dst_flows[dst_ip] = []
+            dst_flows[dst_ip].append(i)
 
+        # Check aggregated totals
+        for dst_ip, total_bytes in dst_bytes.items():
             if total_bytes >= EXFIL_HIGH_BYTES:
                 mb = total_bytes / (1024 * 1024)
                 reason = f"{mb:.1f} MB uploaded to {dst_ip}"
-                results.append((i, 'data_exfil', SEVERITY_HIGH, reason))
+                for idx in dst_flows[dst_ip]:
+                    results.append((idx, 'data_exfil', SEVERITY_HIGH, reason))
             elif total_bytes >= EXFIL_MEDIUM_BYTES:
                 mb = total_bytes / (1024 * 1024)
                 reason = f"{mb:.1f} MB uploaded to {dst_ip}"
-                results.append((i, 'data_exfil', SEVERITY_MEDIUM, reason))
+                for idx in dst_flows[dst_ip]:
+                    results.append((idx, 'data_exfil', SEVERITY_MEDIUM, reason))
 
         return results
 

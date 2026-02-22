@@ -109,6 +109,13 @@ class TsharkCapture:
         # Behavioral tagging engine (complements Suricata)
         self._behavior_engine = BehaviorEngine(db=self._db)
 
+        # DNS reverse lookup: IP → domain name (for CDN-aware beaconing detection)
+        # Populated from DNS response packets during capture
+        self._ip_to_domain = {}
+
+        # Track which behavioral alerts we've already sent (avoid duplicates on each flush)
+        self._alerted_behaviors = set()  # {(dst_ip_or_domain, tag_name), ...}
+
         # Suricata IDS engine (Process 3)
         self._suricata = None
         self.alerts = []  # Live alerts for CLI access
@@ -300,6 +307,10 @@ class TsharkCapture:
         # Normalize arrow: tshark -i - uses → but Wireshark GUI uses  >  
         info_clean = info_clean.replace('\u2192', '→')
 
+        # Extract DNS domain→IP mappings from response packets
+        if application == 'DNS' and info_clean:
+            self._update_dns_mapping(info_clean)
+
         return {
             'packet_id': packet_id,
             'absolute_timestamp': abs_ts,
@@ -314,6 +325,50 @@ class TsharkCapture:
             'packet_length': pkt_len,
             'info': info_clean,
         }
+
+    # ── DNS domain tracking ────────────────────────────────────
+
+    def _update_dns_mapping(self, info_str):
+        """Extract IP→domain mappings from DNS response info strings.
+
+        tshark DNS response info looks like:
+          'Standard query response 0x1234 A example.com A 104.18.27.120 A 104.18.26.120'
+          'Standard query response 0x5678 AAAA example.com AAAA 2606:4700::1'
+
+        We extract the domain and all resolved IPs, building a reverse lookup
+        so the beaconing detector can group by domain instead of raw IP.
+        """
+        if 'response' not in info_str:
+            return
+
+        parts = info_str.split()
+        domain = None
+        ips = []
+
+        i = 0
+        while i < len(parts):
+            if parts[i] in ('A', 'AAAA') and i + 1 < len(parts):
+                next_val = parts[i + 1]
+                if '.' in next_val and not next_val.startswith('0x'):
+                    # Could be a domain name or an IP address
+                    # Domain names have letters; IPs are all digits and dots
+                    has_alpha = any(c.isalpha() for c in next_val)
+                    if has_alpha and domain is None:
+                        # This is the queried domain name
+                        domain = next_val
+                    elif not has_alpha or ':' in next_val:
+                        # This is an IP address (IPv4 or IPv6)
+                        ips.append(next_val)
+                elif ':' in next_val:
+                    # IPv6 address
+                    ips.append(next_val)
+                i += 2
+            else:
+                i += 1
+
+        if domain and ips:
+            for ip in ips:
+                self._ip_to_domain[ip] = domain
 
     # ── Pcapng file helpers ────────────────────────────────────
 
@@ -628,7 +683,8 @@ class TsharkCapture:
         flows = self._tracker.get_flows()
         if flows:
             # Run behavioral analysis and attach tags to flows
-            tags_map = self._behavior_engine.analyze(flows)
+            # Pass IP→domain mapping so beaconing detector can group by domain
+            tags_map = self._behavior_engine.analyze(flows, ip_to_domain=self._ip_to_domain)
             for i, flow in enumerate(flows):
                 if i in tags_map:
                     tag_list = tags_map[i]
@@ -639,6 +695,53 @@ class TsharkCapture:
                         (t[1] for t in tag_list),
                         key=lambda s: sev_order.get(s, 0)
                     )
+
+                    # Surface behavioral tags as alerts (so they appear in `show alerts`)
+                    for tag_name, severity, reason in tag_list:
+                        dst = flow.get('dst_ip', '')
+                        # Use domain name if available
+                        dst_display = self._ip_to_domain.get(dst, dst)
+                        alert_key = (dst_display, tag_name)
+
+                        if alert_key not in self._alerted_behaviors:
+                            self._alerted_behaviors.add(alert_key)
+
+                            # Map tag names to user-friendly alert signatures
+                            tag_signatures = {
+                                'beaconing': f'NETGUARD BEHAVIOR Beaconing Detected — {reason}',
+                                'data_exfil': f'NETGUARD BEHAVIOR Data Exfiltration — {reason}',
+                                'new_dest': f'NETGUARD BEHAVIOR New Destination — {reason}',
+                                'traffic_anomaly': f'NETGUARD BEHAVIOR Traffic Anomaly — {reason}',
+                            }
+                            signature = tag_signatures.get(tag_name, f'NETGUARD BEHAVIOR {tag_name} — {reason}')
+
+                            alert = {
+                                'timestamp': datetime.now().isoformat(),
+                                'severity': severity.upper(),
+                                'severity_num': {'low': 3, 'medium': 2, 'high': 1, 'critical': 1}.get(severity, 3),
+                                'signature': signature,
+                                'signature_id': 0,
+                                'category': f'Behavioral: {tag_name}',
+                                'src_ip': flow.get('src_ip', ''),
+                                'dst_ip': dst,
+                                'src_port': flow.get('src_port'),
+                                'dst_port': flow.get('dst_port'),
+                                'proto': flow.get('protocol', ''),
+                                'action': 'allowed',
+                            }
+                            # Add to live alerts list and persist to DB
+                            self.alerts.append(alert)
+                            try:
+                                self._db.insert_alert(alert, self.session_id)
+                            except Exception:
+                                pass
+                            # Trigger real-time display (same as Suricata alerts)
+                            if self.on_packet:
+                                try:
+                                    self.on_packet({'_alert': alert})
+                                except Exception:
+                                    pass
+
             self._db.flush_connections(flows, self.session_id)
             # Update known destinations for future new_dest / anomaly detection
             self._db.update_known_destinations(flows)
