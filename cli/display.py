@@ -149,7 +149,7 @@ def print_stats_table(transport_counts, application_counts, direction_counts,
         proto_table.add_column("Distribution", min_width=30)
         
         sorted_protos = sorted(application_counts.items(), key=lambda x: x[1], reverse=True)
-        for proto, count in sorted_protos[:20]:
+        for proto, count in sorted_protos:
             pct = (count / total_packets * 100) if total_packets > 0 else 0
             bar_len = int(pct / 2)
             bar = "█" * bar_len + "░" * (50 - bar_len)
