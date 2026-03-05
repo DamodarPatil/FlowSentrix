@@ -42,9 +42,14 @@ class NetGuardDatabase:
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
         
-        # Create persistent connection
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        # Create persistent connection with timeout for lock contention
+        self.conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
         self.cursor = self.conn.cursor()
+        
+        # Enable WAL mode — allows concurrent reads while writing
+        # This is critical for the web API reading while capture writes
+        self.cursor.execute("PRAGMA journal_mode=WAL")
+        self.cursor.execute("PRAGMA busy_timeout=10000")
         
         # Initialize database schema
         self._init_database()
@@ -269,7 +274,7 @@ class NetGuardDatabase:
             List of tuples: (id, start_time, end_time, total_packets,
                              total_bytes, interface, pcap_file, alert_count)
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         try:
             cursor.execute("""
@@ -310,7 +315,7 @@ class NetGuardDatabase:
         Returns:
             Dict with protocol_stats, direction_counts, totals, etc.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
 
         # Check session exists
@@ -358,7 +363,7 @@ class NetGuardDatabase:
 
     def get_recent_session_id(self) -> Optional[int]:
         """Get the ID of the most recent session."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         cursor.execute("SELECT id FROM sessions ORDER BY id DESC LIMIT 1")
         row = cursor.fetchone()
@@ -373,7 +378,7 @@ class NetGuardDatabase:
         Returns:
             True if session existed and was deleted, False otherwise
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
 
         # Check existence
@@ -395,7 +400,7 @@ class NetGuardDatabase:
         Returns:
             Number of sessions deleted, or -1 on error
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         try:
             cursor.execute("SELECT COUNT(*) FROM sessions")
@@ -466,7 +471,7 @@ class NetGuardDatabase:
 
     def get_packet_count(self) -> int:
         """Get total packet count (sum across all connections)."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         
         cursor.execute("SELECT COALESCE(SUM(total_packets), 0) FROM connections")
@@ -477,7 +482,7 @@ class NetGuardDatabase:
     
     def get_connection_count(self) -> int:
         """Get total number of connections/flows."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         
         cursor.execute("SELECT COUNT(*) FROM connections")
@@ -493,7 +498,7 @@ class NetGuardDatabase:
         Returns:
             List of tuples: (protocol, packet_count, total_bytes)
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -509,7 +514,7 @@ class NetGuardDatabase:
 
     def get_cumulative_stats(self) -> Dict:
         """Get cumulative stats from all sessions."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
 
         # Protocol breakdown from connections
@@ -570,7 +575,7 @@ class NetGuardDatabase:
         if order_by not in allowed:
             order_by = 'total_bytes'
         
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         
         if session_id is not None:
@@ -611,7 +616,7 @@ class NetGuardDatabase:
         Returns:
             List of matching connections
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         
         if session_id is not None:
@@ -653,7 +658,7 @@ class NetGuardDatabase:
         Returns:
             List of matching connections
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         
         if session_id is not None:
@@ -695,7 +700,7 @@ class NetGuardDatabase:
         Returns:
             List of matching connections
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         
         if session_id is not None:
@@ -737,7 +742,7 @@ class NetGuardDatabase:
         Returns:
             List of tuples: (ip, total_connections, total_packets, total_bytes)
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         
         if session_id is not None:
@@ -795,7 +800,7 @@ class NetGuardDatabase:
         Args:
             days: Delete connections older than this many days
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -819,7 +824,7 @@ class NetGuardDatabase:
         Returns:
             Number of deleted connections
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -859,7 +864,7 @@ class NetGuardDatabase:
         """
         import csv
         
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         
         if session_id is not None:
@@ -939,7 +944,7 @@ class NetGuardDatabase:
 
     def get_alerts(self, limit: int = 100, session_id: int = None) -> List[tuple]:
         """Get recent alerts ordered by timestamp descending."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         if session_id is not None:
             cursor.execute("""
@@ -964,7 +969,7 @@ class NetGuardDatabase:
 
     def get_threat_summary(self, session_id: int = None) -> Dict:
         """Get a summary of threats: severity counts, top attackers, top signatures."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
 
         where = "WHERE session_id = ?" if session_id is not None else ""
@@ -1002,7 +1007,7 @@ class NetGuardDatabase:
 
     def get_alert_count(self) -> int:
         """Get total alert count."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM alerts")
         count = cursor.fetchone()[0]
@@ -1025,7 +1030,7 @@ class NetGuardDatabase:
 
     def get_ip_reputation(self, ip: str) -> Optional[Dict]:
         """Get cached IP reputation, or None if not cached."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         cursor.execute("""
             SELECT abuse_score, country, isp, is_malicious, last_checked
@@ -1052,7 +1057,7 @@ class NetGuardDatabase:
         """
         if not ips:
             return set()
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         placeholders = ','.join('?' * len(ips))
         cursor.execute(f"""
@@ -1103,7 +1108,7 @@ class NetGuardDatabase:
         """
         if not ips:
             return {}
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         placeholders = ','.join('?' * len(ips))
         cursor.execute(f"""
@@ -1123,7 +1128,7 @@ class NetGuardDatabase:
         Returns:
             List of matching connections
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
         if session_id is not None:
             cursor.execute("""
@@ -1153,7 +1158,7 @@ class NetGuardDatabase:
 
     def get_tag_summary(self) -> Dict:
         """Get summary of behavioral tags: counts by tag and severity."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         cursor = conn.cursor()
 
         # Get all tagged connections

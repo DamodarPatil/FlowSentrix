@@ -8,6 +8,9 @@ import { useSession } from '../context/SessionContext'
 
 const API = 'http://localhost:8000'
 
+// ── Module-level cache for instant tab switches ──
+const _alertsCache = new Map()
+
 // ── Severity configuration ──
 const SEV_CONFIG = {
     high: {
@@ -173,16 +176,21 @@ const fmtTime = (isoStr) => {
 // Alerts Page Component
 // ═══════════════════════════════════════════════════════════════
 const Alerts = () => {
-    const [alerts, setAlerts] = useState([])
-    const [loading, setLoading] = useState(true)
+    const { sessionId } = useSession()
+    const cacheKey = `alerts-${sessionId || 0}`
+    const cached = _alertsCache.get(cacheKey)
+
+    const [alerts, setAlerts] = useState(cached?.alerts || [])
+    const [loading, setLoading] = useState(!cached)
     const [isLive, setIsLive] = useState(false)
 
     // Counts
-    const [totalCount, setTotalCount] = useState(0)
-    const [highCount, setHighCount] = useState(0)
-    const [mediumCount, setMediumCount] = useState(0)
-    const [lowCount, setLowCount] = useState(0)
-    const [allProtocols, setAllProtocols] = useState([])
+    const [totalCount, setTotalCount] = useState(cached?.totalCount || 0)
+    const [highCount, setHighCount] = useState(cached?.highCount || 0)
+    const [mediumCount, setMediumCount] = useState(cached?.mediumCount || 0)
+    const [lowCount, setLowCount] = useState(cached?.lowCount || 0)
+    const [allProtocols, setAllProtocols] = useState(cached?.protocols || [])
+    const [totalPages, setTotalPages] = useState(cached?.totalPages || 1)
 
     // Filters
     const [search, setSearch] = useState('')
@@ -191,12 +199,10 @@ const Alerts = () => {
     const [dateFrom, setDateFrom] = useState('')
     const [dateTo, setDateTo] = useState('')
     const [grouped, setGrouped] = useState(false)
-    const { sessionId } = useSession()
 
     // Pagination
     const [page, setPage] = useState(1)
     const [perPage, setPerPage] = useState(50)
-    const [totalPages, setTotalPages] = useState(1)
 
     // Expand
     const [expanded, setExpanded] = useState(null)
@@ -205,7 +211,7 @@ const Alerts = () => {
     const intervalRef = useRef(null)
 
     const fetchAlerts = useCallback(async () => {
-        setLoading(true)
+        if (!_alertsCache.has(cacheKey)) setLoading(true)
         try {
             const params = new URLSearchParams({
                 page, per_page: perPage,
@@ -223,9 +229,21 @@ const Alerts = () => {
             setMediumCount(data.medium_count || 0)
             setLowCount(data.low_count || 0)
             setAllProtocols(data.protocols || [])
+            // Cache default view
+            if (!search && !severity && !proto && !dateFrom && !dateTo && !grouped && page === 1) {
+                _alertsCache.set(cacheKey, {
+                    alerts: data.alerts || [],
+                    totalCount: data.total_count || 0,
+                    totalPages: data.total_pages || 1,
+                    highCount: data.high_count || 0,
+                    mediumCount: data.medium_count || 0,
+                    lowCount: data.low_count || 0,
+                    protocols: data.protocols || [],
+                })
+            }
         } catch (e) { /* api offline */ }
         finally { setLoading(false) }
-    }, [page, perPage, severity, search, proto, dateFrom, dateTo, grouped, sessionId])
+    }, [page, perPage, severity, search, proto, dateFrom, dateTo, grouped, sessionId, cacheKey])
 
     // Check capture status for live mode
     useEffect(() => {

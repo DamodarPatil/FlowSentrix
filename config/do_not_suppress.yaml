@@ -1,0 +1,121 @@
+# =============================================================================
+# NetGuard — DO NOT SUPPRESS List
+# =============================================================================
+# Alerts, signatures, and IP pairs in this file must NEVER be suppressed,
+# whitelisted, or severity-demoted — regardless of any other tuning rule.
+#
+# This file takes HIGHEST PRIORITY over all other tuning configurations.
+# If a match exists here, no suppress/whitelist rule can override it.
+#
+# Last updated: 2026-03-04
+# =============================================================================
+
+
+# ─── Confirmed True Positive Alerts ─────────────────────────────────────────
+# These have been manually verified as real attacks.
+
+confirmed_alerts:
+
+  - name: "SSH Password Spray (10+ targets)"
+    signature_pattern: "NETGUARD BRUTE-FORCE SSH Password Spray"
+    source_ip: "10.92.237.60"
+    target_ip: "10.92.237.82"
+    target_port: 22
+    severity: CRITICAL
+    reason: >
+      Confirmed brute-force SSH password spray attack.
+      10.92.237.60 attempted logins against 10+ targets including
+      10.92.237.82:22. This is a lateral movement indicator.
+
+  - name: "SSH Brute Force Detected"
+    signature_pattern: "NETGUARD BRUTE-FORCE SSH Brute Force Detected"
+    source_ip: "10.92.237.60"
+    target_ip: "10.92.237.82"
+    target_port: 22
+    severity: CRITICAL
+    reason: >
+      Same attack, different detection rule. Both must remain active
+      to catch the attack from multiple detection angles.
+
+
+# ─── Alert Categories That Must Never Be Suppressed ─────────────────────────
+# Even if future tuning rules try to suppress these categories, they must
+# remain active.
+
+protected_categories:
+
+  - category: "SSH Brute Force"
+    match_signature: "BRUTE-FORCE SSH"
+    min_severity: HIGH
+    reason: >
+      Any SSH brute-force detection from any internal RFC1918 source
+      to any internal RFC1918 destination must remain active.
+      This covers 10.x.x.x, 172.16-31.x.x, and 192.168.x.x.
+
+  - category: "Lateral Movement"
+    match_signature: "LATERAL"
+    min_severity: HIGH
+    reason: >
+      Lateral movement between internal hosts is always a critical finding.
+
+  - category: "Malware Download"
+    match_signature: "MALWARE"
+    min_severity: MEDIUM
+    reason: >
+      Malware signature matches should never be suppressed even if
+      the destination is a CDN (compromised CDN-hosted malware exists).
+
+  - category: "Exploit Attempt"
+    match_signature: "EXPLOIT"
+    min_severity: MEDIUM
+    reason: >
+      Exploit attempts against internal services must always alert.
+
+  - category: "Command and Control"
+    match_signature: "C2"
+    min_severity: MEDIUM
+    reason: >
+      C2 traffic patterns to truly unknown infrastructure must alert.
+      Note: beaconing to KNOWN CDN/cloud is suppressed separately;
+      this protects against beaconing to unknown destinations.
+
+
+# ─── IP Pairs That Must Never Be Whitelisted ─────────────────────────────────
+# These specific source→destination pairs have exhibited confirmed
+# malicious behavior. Never add them to any allowlist.
+
+protected_ip_pairs:
+
+  - source: "10.92.237.60"
+    destination: "10.92.237.82"
+    port: 22
+    reason: "Confirmed SSH brute-force attacker → victim pair."
+
+  # Future entries go here as new threats are confirmed.
+  # Example:
+  # - source: "10.87.x.x"
+  #   destination: "10.92.x.x"
+  #   port: 22
+  #   reason: "Confirmed lateral movement."
+
+
+# ─── Suricata SIDs That Must Never Be Suppressed ────────────────────────────
+# These Suricata signature IDs are critical detections.
+
+protected_sids:
+
+  - sid: 2001219
+    name: "ET SCAN SSH Brute Force Attempt"
+    reason: "Core SSH brute-force detection rule."
+
+  - sid: 2003068
+    name: "ET SCAN Potential SSH Scan OUTBOUND"
+    reason: "Detects SSH scanning from compromised internal hosts."
+
+  - sid: 2019284
+    name: "ET SCAN SSH Vertical Port Scan"
+    reason: "Detects vertical SSH scanning (one host, many ports)."
+
+  - sid: 2210000
+    name: "SURICATA STREAM Reassembly Overlap"
+    reason: "TCP shenanigans — potential evasion attempt."

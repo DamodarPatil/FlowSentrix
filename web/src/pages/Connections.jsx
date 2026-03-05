@@ -4,6 +4,9 @@ import { useSession } from '../context/SessionContext'
 
 const API = 'http://localhost:8000'
 
+// ── Module-level cache for instant tab switches ──
+const _connCache = new Map()
+
 // Protocol → neon color map
 const PROTO_COLORS = {
     'TLSv1.2': '#00f3ff', 'TLSv1.3': '#00f3ff', 'TLSv1': '#00b8cc',
@@ -85,11 +88,16 @@ const inputStyle = {
 }
 
 const Connections = () => {
-    const [connections, setConnections] = useState([])
-    const [allProtocols, setAllProtocols] = useState([])
-    const [allTags, setAllTags] = useState([])
-    const [loading, setLoading] = useState(true)
     const { sessionId } = useSession()
+    const cacheKey = `connections-${sessionId || 0}`
+    const cached = _connCache.get(cacheKey)
+
+    const [connections, setConnections] = useState(cached?.connections || [])
+    const [allProtocols, setAllProtocols] = useState(cached?.protocols || [])
+    const [allTags, setAllTags] = useState(cached?.tags || [])
+    const [totalCount, setTotalCount] = useState(cached?.totalCount || 0)
+    const [totalPages, setTotalPages] = useState(cached?.totalPages || 1)
+    const [loading, setLoading] = useState(!cached)
 
     // Filters
     const [search, setSearch] = useState('')
@@ -101,13 +109,12 @@ const Connections = () => {
     // Pagination
     const [page, setPage] = useState(1)
     const [perPage, setPerPage] = useState(50)
-    const [totalCount, setTotalCount] = useState(0)
-    const [totalPages, setTotalPages] = useState(1)
 
     const [expanded, setExpanded] = useState(null)
 
     const fetchConnections = useCallback(async () => {
-        setLoading(true)
+        // Only show spinner on cold start (no cache)
+        if (!_connCache.has(cacheKey)) setLoading(true)
         try {
             const params = new URLSearchParams({
                 page, per_page: perPage,
@@ -122,12 +129,22 @@ const Connections = () => {
             setAllTags(data.tags || [])
             setTotalCount(data.total_count || 0)
             setTotalPages(data.total_pages || 1)
+            // Cache default view for instant tab switches
+            if (!search && !proto && !tag && !dateFrom && !dateTo && page === 1) {
+                _connCache.set(cacheKey, {
+                    connections: data.connections || [],
+                    protocols: data.protocols || [],
+                    tags: data.tags || [],
+                    totalCount: data.total_count || 0,
+                    totalPages: data.total_pages || 1,
+                })
+            }
         } catch (e) {
             // silently fail
         } finally {
             setLoading(false)
         }
-    }, [page, perPage, search, proto, tag, dateFrom, dateTo, sessionId])
+    }, [page, perPage, search, proto, tag, dateFrom, dateTo, sessionId, cacheKey])
 
     // Reset to page 1 when filters change
     useEffect(() => {

@@ -6,6 +6,7 @@ import {
     Play, Square
 } from 'lucide-react'
 import { useSession } from '../context/SessionContext'
+import { useApiCache } from '../hooks/useApiCache'
 
 const API = 'http://localhost:8000'
 
@@ -80,29 +81,35 @@ const DataBox = ({ label, value, sub, color, icon }) => (
 // Settings Page
 // ═══════════════════════════════════════════════════════════════
 const Settings = () => {
-    const [system, setSystem] = useState(null)
-    const [data, setData] = useState(null)
-    const [loading, setLoading] = useState(true)
     const [clearing, setClearing] = useState(false)
     const [deletingSession, setDeletingSession] = useState(null)
     const [confirmClear, setConfirmClear] = useState(false)
     const [expandedSession, setExpandedSession] = useState(null)
     const { sessionId, loadSession, unloadSession } = useSession()
 
-    const fetchData = useCallback(async () => {
-        setLoading(true)
-        try {
-            const [sysRes, dataRes] = await Promise.all([
-                fetch(`${API}/api/settings/system`),
-                fetch(`${API}/api/settings/data`),
-            ])
-            setSystem(await sysRes.json())
-            setData(await dataRes.json())
-        } catch (e) { /* offline */ }
-        finally { setLoading(false) }
-    }, [])
+    // SWR cache — shows last-known data instantly, refreshes in background
+    const { data: system, refresh: refreshSystem } = useApiCache(
+        'settings-system',
+        async () => {
+            const res = await fetch(`${API}/api/settings/system`)
+            return res.json()
+        },
+        { fallback: null }
+    )
 
-    useEffect(() => { fetchData() }, [fetchData])
+    const { data: data, loading, refresh: refreshData } = useApiCache(
+        'settings-data',
+        async () => {
+            const res = await fetch(`${API}/api/settings/data`)
+            return res.json()
+        },
+        { fallback: null }
+    )
+
+    const fetchData = useCallback(() => {
+        refreshSystem()
+        refreshData()
+    }, [refreshSystem, refreshData])
 
     const handleClearAll = async () => {
         setClearing(true)

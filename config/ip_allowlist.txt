@@ -1,0 +1,77 @@
+# =============================================================================
+# NetGuard — IP Allowlist (CIDR format)
+# =============================================================================
+# Two trust tiers:
+#   [TRUSTED]       — Fully exempt from all behavioral alerting
+#   [SEMI-TRUSTED]  — Conditional suppression only (see behavior_engine.py)
+#
+# Semi-trusted rules:
+#   - new_dest / traffic_anomaly: suppress only if transfer < 10 MB
+#   - data_exfil: always alert above 50 MB, demote to MEDIUM (not suppress)
+#   - beaconing: always alert on non-standard ports (not 443/80)
+#   - Never suppress for unusual protocols
+#
+# Last updated: 2026-03-04
+# =============================================================================
+
+
+# [TRUSTED]
+# ─── These IPs are FULLY exempt from behavioral alerting ───────────────────
+
+# ── Google / YouTube / GCP ──
+# Ranges from: https://www.gstatic.com/ipranges/goog.json
+2404:6800::/32                  # Google India/APAC IPv6
+2607:f8b0::/32                  # Google US/Global IPv6
+2a00:1450::/32                  # Google EU IPv6
+142.250.0.0/15                  # Google Global IPv4
+172.217.0.0/16                  # Google Global IPv4 (alt)
+216.58.0.0/16                   # Google Legacy IPv4
+
+# ── Facebook / Meta ──
+# Ranges from: whois -h whois.radb.net -- '-i origin AS32934'
+2a03:2880::/32                  # Meta Global IPv6
+157.240.0.0/16                  # Meta Global IPv4
+
+# ── Fastly CDN ──
+# Serves: GitHub, Reddit, npm, PyPI, and many others
+2a04:4e42::/32                  # Fastly Global IPv6
+151.101.0.0/16                  # Fastly Global IPv4
+
+# ── Microsoft / Azure ──
+# Ranges from: Azure IP Ranges and Service Tags JSON
+# Covers: VS Code, Windows Update, Teams, GitHub (MS-owned)
+2603:1000::/24                  # Azure Global IPv6
+20.0.0.0/8                      # Azure Global IPv4 (primary)
+13.64.0.0/11                    # Azure US IPv4
+40.64.0.0/10                    # Azure Global IPv4 (classic)
+
+# ── AWS ──
+# Ranges from: ip-ranges.amazonaws.com
+# Covers: S3, CloudFront, EC2-hosted services
+2600:1f00::/24                  # AWS Global IPv6
+3.0.0.0/8                       # AWS Global IPv4 (primary)
+52.0.0.0/8                      # AWS Global IPv4 (classic)
+
+# ── Loopback / Localhost ──
+# systemd-resolved (127.0.0.53), local services
+127.0.0.0/8                     # IPv4 loopback
+::1/128                          # IPv6 loopback
+
+
+# [SEMI-TRUSTED]
+# ─── These IPs get CONDITIONAL suppression only ───────────────────────────
+# Attackers can abuse these infrastructures. Never fully trust them.
+
+# ── NAT64 Prefix ──
+# Router translates IPv4 destinations into IPv6 using this prefix.
+# Normal in dual-stack networks, but an attacker COULD route C2 traffic
+# through NAT64 to bypass IPv4-only IDS rules.
+64:ff9b::/96                    # NAT64 well-known prefix (RFC 6052)
+
+# ── Cloudflare ──
+# Cloudflare provides CDN/DNS/proxy for millions of sites INCLUDING
+# malicious ones. Phishing sites, C2 panels, and malware staging all
+# use Cloudflare regularly. Cannot be blindly trusted.
+2606:4700::/32                  # Cloudflare IPv6
+104.16.0.0/12                   # Cloudflare IPv4 primary
+172.64.0.0/13                   # Cloudflare IPv4 secondary

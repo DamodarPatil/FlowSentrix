@@ -26,9 +26,60 @@ app.add_middleware(
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "netguard.db")
 
+# ── Startup migration: reclassify alerts to 3-tier schema ──
+# CRITICAL(HIGH)=1, WARNING(MEDIUM)=2, INFO(LOW)=3
+try:
+    import sqlite3 as _sq
+    _mconn = _sq.connect(DB_PATH, timeout=5)
+    _mc = _mconn.cursor()
+    _rules = [
+        # CRITICAL (severity_num=1): active threats
+        ("HIGH", 1, "%BRUTE%FORCE%"),
+        ("HIGH", 1, "%SCAN%Scan%"),
+        ("HIGH", 1, "%Rapid Port Scan%"),
+        ("HIGH", 1, "%Data Exfiltration%"),
+        # WARNING (severity_num=2): suspicious activity
+        ("MEDIUM", 2, "%Beaconing Detected%"),
+        ("MEDIUM", 2, "%Traffic Anomaly%"),
+        ("MEDIUM", 2, "SURICATA%"),
+        ("MEDIUM", 2, "%FILE_SHARING%"),
+        # INFO (severity_num=3): informational
+        ("LOW", 3, "ET INFO%"),
+        ("LOW", 3, "ET POLICY%"),
+        ("LOW", 3, "ET DNS%"),
+        ("LOW", 3, "%New Destination%"),
+        ("LOW", 3, "%GNU/Linux APT%"),
+    ]
+    for sev, sev_num, pattern in _rules:
+        _mc.execute(
+            "UPDATE alerts SET severity = ?, severity_num = ? WHERE signature LIKE ?",
+            (sev, sev_num, pattern)
+        )
+    # Fix any remaining mismatches
+    _mc.execute("UPDATE alerts SET severity_num = 3 WHERE severity IN ('LOW','low') AND severity_num != 3")
+    _mc.execute("UPDATE alerts SET severity_num = 2 WHERE severity IN ('MEDIUM','medium') AND severity_num != 2")
+    _mc.execute("UPDATE alerts SET severity_num = 1 WHERE severity IN ('HIGH','high','CRITICAL','critical') AND severity_num != 1")
+    _mconn.commit()
+    _mconn.close()
+except Exception:
+    pass
+
 
 def get_db():
     return NetGuardDatabase(db_path=DB_PATH)
+
+
+def get_read_conn():
+    """Get a SQLite connection configured for concurrent access.
+
+    WAL mode allows readers to proceed while the capture writer is active.
+    A short busy_timeout prevents API requests from hanging forever.
+    """
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
 
 
 def fmt_bytes(b):
@@ -111,8 +162,7 @@ def get_alerts(
     session_id: int = Query(0, ge=0, description="Filter by session ID (0 = all)"),
 ):
     """Get alerts with pagination, filters, and severity breakdown."""
-    import sqlite3
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_read_conn()
     cursor = conn.cursor()
 
     where_clauses = []
@@ -255,8 +305,7 @@ def get_connections(
     session_id: int = Query(0, ge=0, description="Filter by session ID (0 = all)"),
 ):
     """Get connections with pagination and filters."""
-    import sqlite3
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_read_conn()
     cursor = conn.cursor()
 
     where_clauses = []
@@ -357,22 +406,31 @@ def get_connections(
 def get_latest_alert():
     """Returns the most recent alert's id and timestamp — used by frontend for new-alert detection."""
     import sqlite3
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, timestamp, severity, signature, src_ip, dst_ip FROM alerts ORDER BY id DESC LIMIT 1")
-    row = cursor.fetchone()
-    conn.close()
-    if not row:
-        return {"id": 0, "timestamp": "", "severity": "", "title": "", "meta": ""}
-    id_, ts, sev, sig, src, dst = row
-    sev_label = "high" if sev == 1 else ("medium" if sev == 2 else "low")
-    return {
-        "id": id_,
-        "timestamp": ts,
-        "severity": sev_label,
-        "title": sig or "Unknown Alert",
-        "meta": f"{src} → {dst}",
-    }
+    # This endpoint is polled every ~2s — retry on lock instead of crashing
+    for attempt in range(3):
+        try:
+            conn = get_read_conn()
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, timestamp, severity_num, signature, src_ip, dst_ip FROM alerts ORDER BY id DESC LIMIT 1")
+            row = cursor.fetchone()
+            conn.close()
+            if not row:
+                return {"id": 0, "timestamp": "", "severity": "", "title": "", "meta": ""}
+            id_, ts, sev_num, sig, src, dst = row
+            sev_label = "high" if sev_num == 1 else ("medium" if sev_num == 2 else "low")
+            return {
+                "id": id_,
+                "timestamp": ts,
+                "severity": sev_label,
+                "title": sig or "Unknown Alert",
+                "meta": f"{src} → {dst}",
+            }
+        except sqlite3.OperationalError:
+            import time as _t
+            _t.sleep(0.2 * (attempt + 1))
+    # All retries exhausted — return empty rather than crash
+    return {"id": 0, "timestamp": "", "severity": "", "title": "", "meta": ""}
+
 
 import threading
 import time as _time
@@ -397,6 +455,7 @@ class CaptureManager:
         self._packet_buffer = []      # Ring buffer of last 200 packets
         self._packet_lock = threading.Lock()
         self._packet_id_counter = 0
+        self._reprocessing_active = False
 
     @property
     def is_running(self):
@@ -456,9 +515,13 @@ class CaptureManager:
         if str(src_port) in skip_ports or str(dst_port) in skip_ports:
             return
 
-        proto = data.get('application_protocol', data.get('transport_protocol', '?'))
-        src = data.get('display_src', data.get('src', '?'))
-        dst = data.get('display_dst', data.get('dst', '?'))
+        proto = data.get('application_protocol', data.get('transport_protocol', ''))
+        src = data.get('display_src', data.get('src', ''))
+        dst = data.get('display_dst', data.get('dst', ''))
+
+        # Skip incomplete packets — tshark outputs empty fields during high-speed bursts
+        if not src or not dst:
+            return
 
         src_display = f"{src}:{src_port}" if src_port else src
         dst_display = f"{dst}:{dst_port}" if dst_port else dst
@@ -497,16 +560,7 @@ class CaptureManager:
         except Exception as e:
             self.error = str(e)
         finally:
-            if self.state == "stopping":
-                # Reprocess for accurate stats
-                self.state = "analyzing"
-                try:
-                    if self.sniffer and self.sniffer.pcap_file:
-                        self.sniffer.reprocess()
-                except Exception:
-                    pass
-
-            # Save final stats
+            # Save final stats immediately — don't wait for reprocessing
             if self.sniffer:
                 self.last_stats = {
                     "packets": self.sniffer.packets_captured,
@@ -516,7 +570,27 @@ class CaptureManager:
                     "duration": _time.time() - self.start_time if self.start_time else 0,
                 }
 
+            # Return to idle immediately — reprocess in background
             self.state = "idle"
+
+            # Background reprocessing for accurate DB stats
+            if self.sniffer and self.sniffer.pcap_file:
+                self._reprocessing_active = True
+                reprocess_thread = threading.Thread(
+                    target=self._background_reprocess,
+                    name="NetGuard-Reprocess",
+                    daemon=True,
+                )
+                reprocess_thread.start()
+
+    def _background_reprocess(self):
+        """Run reprocessing in background so GUI isn't blocked."""
+        try:
+            self.sniffer.reprocess()
+        except Exception:
+            pass
+        finally:
+            self._reprocessing_active = False
 
     def stop(self) -> dict:
         with self._lock:
@@ -527,18 +601,30 @@ class CaptureManager:
 
             if self.sniffer:
                 self.sniffer.stop_sniffing.set()
-                # Kill subprocesses
+
+                # Use SIGINT for dumpcap so it flushes and closes the
+                # pcapng file cleanly (SIGTERM can truncate mid-write)
+                import signal
+                if self.sniffer._dumpcap:
+                    try:
+                        self.sniffer._dumpcap.send_signal(signal.SIGINT)
+                    except Exception:
+                        try:
+                            self.sniffer._dumpcap.terminate()
+                        except Exception:
+                            pass
+
+                # tshark can be terminated immediately — we don't need
+                # its output anymore once stop is requested
                 if self.sniffer._tshark:
                     try:
                         self.sniffer._tshark.terminate()
                     except Exception:
                         pass
-                if self.sniffer._dumpcap:
-                    try:
-                        self.sniffer._dumpcap.terminate()
-                    except Exception:
-                        pass
 
+            # Return immediately — don't block the HTTP response.
+            # The GUI polls /api/capture/status and will see state
+            # transition to "idle" when _run_capture finishes.
             return {"ok": True, "message": "Stopping capture..."}
 
     def get_status(self) -> dict:
@@ -595,6 +681,7 @@ class CaptureManager:
             "pps": pps,
             "pcap_file": self.sniffer.pcap_file if self.sniffer else None,
             "error": self.error,
+            "reprocessing": self._reprocessing_active,
         }
 
         # Include last stats if capture just finished
@@ -794,7 +881,7 @@ def get_data_stats():
     pcap_display = fmt_bytes(total_pcap_bytes)
 
     # Session list
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_read_conn()
     cursor = conn.cursor()
     try:
         cursor.execute("""
@@ -871,7 +958,7 @@ def delete_session(session_id: int):
     import sqlite3
 
     # Get pcap file path before deleting
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_read_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT pcap_file FROM sessions WHERE id = ?", (session_id,))
     row = cursor.fetchone()
@@ -882,13 +969,22 @@ def delete_session(session_id: int):
 
     pcap_path = row[0]
 
-    db = get_db()
-    try:
-        ok = db.delete_session(session_id)
-        if not ok:
-            return {"ok": False, "error": "Failed to delete session"}
-    finally:
-        db.close()
+    # Retry the delete in case reprocessing holds the write lock
+    for attempt in range(3):
+        db = get_db()
+        try:
+            ok = db.delete_session(session_id)
+            if ok:
+                break
+            if attempt == 2:
+                return {"ok": False, "error": "Failed to delete session"}
+        except sqlite3.OperationalError:
+            if attempt == 2:
+                return {"ok": False, "error": "Database busy, try again"}
+            import time as _t
+            _t.sleep(0.5)
+        finally:
+            db.close()
 
     # Delete pcap file if it exists
     pcap_deleted = False
@@ -908,7 +1004,7 @@ def delete_session(session_id: int):
 def check_session(session_id: int):
     """Lightweight check if a session still exists."""
     import sqlite3
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_read_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT id, interface, start_time FROM sessions WHERE id = ?", (session_id,))
     row = cursor.fetchone()

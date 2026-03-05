@@ -2,42 +2,54 @@ import { useState, useEffect } from 'react'
 import { Activity, Wifi, HardDrive, Cpu, ArrowUpRight, AlertTriangle, Search, X } from 'lucide-react'
 import { Sparkline, PieChart } from '../components/Charts'
 import { useSession } from '../context/SessionContext'
+import { useApiCache } from '../hooks/useApiCache'
 
 const API = 'http://localhost:8000'
 
 const Dashboard = () => {
-    const [stats, setStats] = useState(null)
-    const [alerts, setAlerts] = useState([])
-    const [apiOnline, setApiOnline] = useState(false)
+    const [apiOnline, setApiOnline] = useState(true)
     const { sessionId } = useSession()
 
+    // SWR cache — shows last-known data instantly, refreshes in background
+    const { data: stats } = useApiCache(
+        `dashboard-stats-${sessionId || 0}`,
+        async () => {
+            const sessionParam = sessionId ? `?session_id=${sessionId}` : ''
+            const res = await fetch(`${API}/api/stats${sessionParam}`)
+            setApiOnline(true)
+            return res.json()
+        },
+        { deps: [sessionId], fallback: null }
+    )
+
+    const { data: alertsData } = useApiCache(
+        `dashboard-alerts-${sessionId || 0}`,
+        async () => {
+            const res = await fetch(`${API}/api/alerts?per_page=10${sessionId ? `&session_id=${sessionId}` : ''}`)
+            return res.json()
+        },
+        { deps: [sessionId], fallback: { alerts: [] } }
+    )
+
+    // Also poll on an interval for freshness
     useEffect(() => {
         const fetchData = async () => {
             try {
                 const sessionParam = sessionId ? `?session_id=${sessionId}` : ''
-                const [statsRes, alertsRes] = await Promise.all([
-                    fetch(`${API}/api/stats${sessionParam}`),
-                    fetch(`${API}/api/alerts?per_page=10${sessionId ? `&session_id=${sessionId}` : ''}`),
-                ])
-                const statsData = await statsRes.json()
-                const alertsData = await alertsRes.json()
-                setStats(statsData)
-                // Map new API fields to dashboard display format
-                setAlerts((alertsData.alerts || []).map(a => ({
-                    title: a.signature || a.title || 'Unknown Alert',
-                    meta: a.meta || `${a.src_ip} → ${a.dst_ip}`,
-                    severity: a.severity,
-                    timestamp: a.timestamp,
-                })))
+                await fetch(`${API}/api/stats${sessionParam}`)
                 setApiOnline(true)
-            } catch (e) {
-                setApiOnline(false)
-            }
+            } catch { setApiOnline(false) }
         }
-        fetchData()
         const interval = setInterval(fetchData, 5000)
         return () => clearInterval(interval)
     }, [sessionId])
+
+    const alerts = (alertsData?.alerts || []).map(a => ({
+        title: a.signature || a.title || 'Unknown Alert',
+        meta: a.meta || `${a.src_ip} → ${a.dst_ip}`,
+        severity: a.severity,
+        timestamp: a.timestamp,
+    }))
 
 
     const pktVal = stats?.total_packets?.value || '0'

@@ -1,0 +1,186 @@
+# =============================================================================
+# NetGuard — Suricata YAML Tuning Sections
+# =============================================================================
+# Copy the relevant sections below into /etc/suricata/suricata.yaml
+# to tune Suricata's engine for this dual-stack IPv4/IPv6 environment
+# with NAT64 (64:ff9b::/96).
+#
+# Each section is labeled with the corresponding suricata.yaml key path.
+# Last updated: 2026-03-04
+# =============================================================================
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vars — Network variable definitions
+# ─────────────────────────────────────────────────────────────────────────────
+# Merge into: suricata.yaml → vars → address-groups
+#
+# HOME_NET includes all observed internal subnets and the NAT64 prefix.
+# EXTERNAL_NET is everything NOT in HOME_NET.
+vars:
+  address-groups:
+    # All internal subnets observed in the environment
+    HOME_NET: "[10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, \
+                64:ff9b::/96, \
+                2409:40c1::/32, \
+                fe80::/10, ::1/128]"
+    EXTERNAL_NET: "!$HOME_NET"
+
+    # Known-safe external servers (for suppress rules / pass rules)
+    GOOGLE_NETS: "[2404:6800::/32, 2600:1901::/32, 2600:1900::/32, \
+                   142.250.0.0/15, 172.217.0.0/16, 216.58.0.0/16, 74.125.0.0/16]"
+    META_NETS: "[2a03:2880::/32, 2405:200::/32, 157.240.0.0/16, 31.13.0.0/16]"
+    FASTLY_NETS: "[2a04:4e42::/32, 151.101.0.0/16]"
+    CLOUDFLARE_NETS: "[2606:4700::/32, 104.16.0.0/12, 172.64.0.0/13]"
+    AZURE_NETS: "[20.0.0.0/8, 13.64.0.0/11, 40.64.0.0/10, 2603:1000::/24]"
+
+  port-groups:
+    HTTP_PORTS: "80"
+    SHELLCODE_PORTS: "!80"
+    ORACLE_PORTS: 1521
+    SSH_PORTS: 22
+    DNP3_PORTS: 20000
+    MODBUS_PORTS: 502
+    FILE_DATA_PORTS: "[80, 110, 143]"
+    FTP_PORTS: 21
+    GENEVE_PORTS: 6081
+    VXLAN_PORTS: 4789
+    TEREDO_PORTS: 3544
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# host-os-policy — IPv6 dual-stack awareness
+# ─────────────────────────────────────────────────────────────────────────────
+# Merge into: suricata.yaml → host-os-policy
+#
+# The primary host (2409:40c1:1001:...) runs Linux; set reassembly policy
+# to 'linux' for accurate TCP reassembly on that OS.
+host-os-policy:
+  - linux:
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 2409:40c1::/32
+  - windows:
+      - 0.0.0.0/0        # fallback — assume Windows for unknown
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# stream — TCP stream engine tuning
+# ─────────────────────────────────────────────────────────────────────────────
+# Merge into: suricata.yaml → stream
+#
+# Tuned for a busy dual-stack network with long-lived TLS/QUIC flows.
+stream:
+  memcap: 256mb                 # Increase from default 64mb for heavy TLS
+  checksum-validation: no       # Disable — NAT64 can invalidate checksums
+  midstream: true               # Allow joining established flows (important
+                                # when Suricata starts mid-connection)
+  async-oneside: true           # Handle asymmetric routing from NAT64
+  reassembly:
+    memcap: 512mb               # More reassembly memory for large uploads
+    depth: 1mb                  # How deep into the stream to inspect
+    toserver-chunk-size: 2560   # Reassembly chunk sizes (bytes)
+    toclient-chunk-size: 2560
+    randomize-chunk-size: yes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# flow — Flow engine and timeouts
+# ─────────────────────────────────────────────────────────────────────────────
+# Merge into: suricata.yaml → flow
+#
+# Extended timeouts for long-lived streaming connections (YouTube, Drive sync).
+flow:
+  memcap: 256mb
+  hash-size: 65536
+  prealloc: 10000
+  emergency-recovery: 30
+  prune-flows: 5
+
+  timeouts:
+    default:
+      new: 30                   # Flow considered "new" for 30s
+      established: 300          # Keep established flows for 5 min
+      closed: 0
+      bypassed: 100
+      emergency-new: 10
+      emergency-established: 100
+      emergency-closed: 0
+      emergency-bypassed: 50
+    tcp:
+      new: 60
+      established: 600          # 10 min for TCP (long-lived HTTPS/TLS)
+      closed: 60
+      bypassed: 100
+      emergency-new: 5
+      emergency-established: 100
+      emergency-closed: 0
+      emergency-bypassed: 50
+    udp:
+      new: 30
+      established: 300          # 5 min for UDP (QUIC sessions to Google)
+      bypassed: 100
+      emergency-new: 10
+      emergency-established: 100
+      emergency-bypassed: 50
+    icmp:
+      new: 30
+      established: 300
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# detect — Detection engine tuning
+# ─────────────────────────────────────────────────────────────────────────────
+# Merge into: suricata.yaml → detect
+detect:
+  profile: medium               # Balance between speed and memory
+  custom-values:
+    toclient-groups: 3
+    toserver-groups: 25
+  sgh-mpm-context: auto
+  inspection-recursion-limit: 3000
+  prefilter:
+    default: mpm                # Multi-pattern matcher for prefiltering
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# app-layer — Protocol-specific settings
+# ─────────────────────────────────────────────────────────────────────────────
+# Merge into: suricata.yaml → app-layer → protocols
+#
+# Enable QUIC detection (Google/YouTube/Meta use UDP:443 QUIC extensively)
+app-layer:
+  protocols:
+    quic:
+      enabled: yes              # QUIC (HTTP/3) — critical for this network
+    tls:
+      enabled: yes
+      detection-ports:
+        dp: 443
+      # Do NOT log full certificates — saves disk and CPU
+      ja3-fingerprints: auto
+    dns:
+      # TCP and UDP DNS
+      tcp:
+        enabled: yes
+        detection-ports:
+          dp: 53
+      udp:
+        enabled: yes
+        detection-ports:
+          dp: 53
+    http:
+      enabled: yes
+    ssh:
+      enabled: yes              # CRITICAL — SSH detection must stay on
+                                # for brute-force detection
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# threshold-file — Reference the threshold.config
+# ─────────────────────────────────────────────────────────────────────────────
+# Add this line to the top-level suricata.yaml:
+#
+# threshold-file: /etc/suricata/threshold.config
+#
+# Copy config/threshold.config to /etc/suricata/threshold.config

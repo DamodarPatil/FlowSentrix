@@ -25,6 +25,7 @@ from core.database import NetGuardDatabase
 from core.connection_tracker import ConnectionTracker
 from core.behavior_engine import BehaviorEngine
 from intelligence.suricata import SuricataEngine
+from config import load_tuning_config
 
 
 # Protocols that are transport-layer
@@ -103,6 +104,10 @@ class TsharkCapture:
         # Reprocessing flag
         self._reprocessing = False
 
+        # Frame dedup for live processing (prevents count inflation
+        # if TCP reassembly causes duplicate tshark output lines)
+        self._live_seen_frames = set()
+
         # Connection/flow tracker (replaces per-packet DB storage)
         self._tracker = ConnectionTracker()
 
@@ -113,12 +118,23 @@ class TsharkCapture:
         # Populated from DNS response packets during capture
         self._ip_to_domain = {}
 
+        # Per-flow TLS version tracking: upgrade TLSv1.2 → TLSv1.3 on flows
+        # where 1.3 was negotiated (tshark without reassembly uses record-header
+        # version 0x0303 which maps to TLSv1.2 even for TLS 1.3 connections)
+        # Key: frozenset({(ip, port), (ip, port)})  Value: 'TLSv1.3' etc.
+        self._tls_flow_versions = {}
+
         # Track which behavioral alerts we've already sent (avoid duplicates on each flush)
         self._alerted_behaviors = set()  # {(dst_ip_or_domain, tag_name), ...}
 
         # Suricata IDS engine (Process 3)
         self._suricata = None
         self.alerts = []  # Live alerts for CLI access
+
+        # ── Tuning config: severity remap + do-not-suppress ──
+        tuning_cfg = load_tuning_config()
+        self._severity_remap = tuning_cfg.get('severity_remap', {})
+        self._do_not_suppress = tuning_cfg.get('do_not_suppress', {})
 
         # CSV logging
         self._csv_writer = None
@@ -262,6 +278,30 @@ class TsharkCapture:
                 proto = 'TLSv1.3'
             elif '0x0303' in versions:
                 proto = 'TLSv1.2'
+
+        # --- Per-flow TLS version tracking ---
+        # TLS 1.3 uses 0x0303 (TLSv1.2) in record headers for compatibility.
+        # Without reassembly, tshark labels most data packets as TLSv1.2 even
+        # if TLS 1.3 was negotiated.  Track the negotiated version from
+        # handshake packets and upgrade subsequent packets on the same flow.
+        is_tls_proto = proto.startswith('TLS') or proto.startswith('SSL')
+        if is_tls_proto and src_port_int is not None and dst_port_int is not None:
+            flow_key = frozenset({(src, src_port_int), (dst, dst_port_int)})
+
+            # If this packet has supported_versions info (handshake),
+            # record the negotiated version for the flow
+            if tls_sup_ver:
+                versions = tls_sup_ver.replace(',', ' ').split()
+                if '0x0304' in versions:
+                    self._tls_flow_versions[flow_key] = 'TLSv1.3'
+                elif '0x0303' in versions and flow_key not in self._tls_flow_versions:
+                    self._tls_flow_versions[flow_key] = 'TLSv1.2'
+
+            # Upgrade protocol using stored flow version
+            known_ver = self._tls_flow_versions.get(flow_key)
+            if known_ver and proto != known_ver:
+                proto = known_ver
+
         if proto in TRANSPORT_PROTOCOLS:
             transport = proto
             application = proto
@@ -296,11 +336,13 @@ class TsharkCapture:
         display_src = self._truncate_ipv6(src) if ':' in src else src
         display_dst = self._truncate_ipv6(dst) if ':' in dst else dst
 
-        # Wireshark-matching: "Continuation Data" packets are TCP segments
-        # In pipe mode tshark labels them SSL/TLSvX but Wireshark GUI shows
-        # them as TCP "[TCP segment of a reassembled PDU]"
+        # --- Wireshark-matching for anomalous TLS segment labels ---
+        # Fallback: if tshark ever labels a segment as "Continuation Data"
+        # or "Ignored Unknown Record", convert to TCP segment indicator.
+        # With tcp.desegment_tcp_streams:TRUE this rarely triggers, but
+        # provides safety for edge cases.
         info_clean = ws_info.strip() if ws_info else ''
-        if info_clean == 'Continuation Data' and transport == 'TCP':
+        if transport == 'TCP' and info_clean in ('Continuation Data', 'Ignored Unknown Record'):
             application = 'TCP'
             info_clean = '[TCP segment of a reassembled PDU]'
 
@@ -493,6 +535,7 @@ class TsharkCapture:
         self.transport_counts = {}
         self.application_counts = {}
         self.direction_counts = {'INCOMING': 0, 'OUTGOING': 0}
+        self._tls_flow_versions = {}  # Rebuild from pcap handshakes
 
         # Clear DB and tracker for clean rebuild from pcapng
         self._tracker.reset()
@@ -510,8 +553,9 @@ class TsharkCapture:
         # Build tshark -r command
         # NOTE: Do NOT enable heuristic RTP/RTCP — they cause tshark to
         # output duplicate lines for the same frame (up to 72x per packet).
-        # Disable TCP desegmentation — reassembly creates virtual frames that
-        # inflate packet counts by ~8%.
+        # TCP desegmentation is ON (default) so tshark reassembles TCP
+        # segments into complete TLS/HTTP records — matching Wireshark GUI.
+        # Frame dedup (seen_frames set below) prevents any count inflation.
         tshark_cmd = [
             'tshark', '-r', self.pcap_file,
             '-l', '-n',
@@ -519,7 +563,6 @@ class TsharkCapture:
             '-E', f'separator={FIELD_SEP}',
             '-E', 'quote=n',
             '-E', 'occurrence=f',
-            '-o', 'tcp.desegment_tcp_streams:FALSE',
         ]
         for field in TSHARK_FIELDS:
             tshark_cmd.extend(['-e', field])
@@ -644,6 +687,13 @@ class TsharkCapture:
             if data is None:
                 continue
 
+            # Deduplicate by frame number (safety net — TCP reassembly
+            # can occasionally produce duplicate output for the same frame)
+            frame_id = data.get('packet_id', 0)
+            if frame_id in self._live_seen_frames:
+                continue
+            self._live_seen_frames.add(frame_id)
+
             # Update running stats
             self.packets_captured += 1
             self.total_bytes += data['packet_length']
@@ -678,8 +728,100 @@ class TsharkCapture:
         # Final flush
         self._flush_tracker()
 
+    # ── Tuning helpers: severity remap + do-not-suppress ─────────
+
+    def _remap_behavioral_severity(self, tag_name: str, original_severity: str) -> str:
+        """Apply severity remap from severity_remap.yaml for behavioral alerts.
+
+        Returns the remapped severity string (e.g. 'SUPPRESS', 'LOW', etc.).
+        If no remap is configured, returns original severity unchanged.
+        """
+        behavioral = self._severity_remap.get('behavioral', {})
+        remap = behavioral.get(tag_name, {})
+        if not remap:
+            return original_severity
+
+        remapped = remap.get('severity', original_severity)
+        # Check if whitelisted destination should get a different severity
+        wl_severity = remap.get('severity_for_whitelisted')
+        if wl_severity:
+            # This is handled in behavior_engine already, but if somehow
+            # a whitelisted alert slips through, apply the override here
+            return remapped
+        return remapped
+
+    def _remap_suricata_severity(self, alert: dict) -> str:
+        """Apply severity remap from severity_remap.yaml for Suricata alerts.
+
+        Checks the alert signature against Suricata category mappings.
+        Returns remapped severity or original if no match.
+        """
+        suricata_remap = self._severity_remap.get('suricata', {})
+        signature = alert.get('signature', '')
+        original_sev = alert.get('severity', 'LOW')
+
+        for category_key, remap in suricata_remap.items():
+            # Match by checking if the signature contains keywords
+            # e.g. NETGUARD_BRUTE_FORCE matches 'BRUTE-FORCE' or 'BRUTE_FORCE'
+            check_key = category_key.replace('_', ' ').replace('-', ' ').upper()
+            sig_upper = signature.upper().replace('-', ' ').replace('_', ' ')
+            if check_key in sig_upper:
+                return remap.get('severity', original_sev)
+
+        return original_sev
+
+    def _is_protected_alert(self, alert: dict) -> bool:
+        """Check if an alert matches the do_not_suppress.yaml protection rules.
+
+        Protected alerts must NEVER be suppressed or severity-demoted,
+        regardless of any other tuning configuration.
+
+        Returns True if this alert is protected.
+        """
+        if not self._do_not_suppress:
+            return False
+
+        signature = alert.get('signature', '')
+        src_ip = alert.get('src_ip', '')
+        dst_ip = alert.get('dst_ip', '')
+        dst_port = alert.get('dst_port')
+
+        # Check confirmed alerts (exact signature pattern match)
+        for entry in self._do_not_suppress.get('confirmed_alerts', []):
+            pattern = entry.get('signature_pattern', '')
+            if pattern and pattern in signature:
+                return True
+
+        # Check protected categories (keyword match in signature)
+        for entry in self._do_not_suppress.get('protected_categories', []):
+            match_sig = entry.get('match_signature', '')
+            if match_sig and match_sig.upper() in signature.upper():
+                return True
+
+        # Check protected IP pairs
+        for pair in self._do_not_suppress.get('protected_ip_pairs', []):
+            if (src_ip == pair.get('source', '') and
+                dst_ip == pair.get('destination', '') and
+                (pair.get('port') is None or dst_port == pair.get('port'))):
+                return True
+
+        # Check protected Suricata SIDs
+        sig_id = alert.get('signature_id', 0)
+        if sig_id:
+            for entry in self._do_not_suppress.get('protected_sids', []):
+                if sig_id == entry.get('sid'):
+                    return True
+
+        return False
+
+    # ── Flush tracker ────────────────────────────────────────────
+
     def _flush_tracker(self):
-        """Flush connection tracker flows to the database with behavioral tags."""
+        """Flush connection tracker flows to the database with behavioral tags.
+
+        Applies severity remapping from severity_remap.yaml and enforces
+        do_not_suppress.yaml protection rules before surfacing alerts.
+        """
         flows = self._tracker.get_flows()
         if flows:
             # Run behavioral analysis and attach tags to flows
@@ -729,6 +871,21 @@ class TsharkCapture:
                                 'proto': flow.get('protocol', ''),
                                 'action': 'allowed',
                             }
+
+                            # ── Apply severity remap (unless protected) ──
+                            if self._is_protected_alert(alert):
+                                # Protected alert — keep original severity, never suppress
+                                pass
+                            else:
+                                remapped = self._remap_behavioral_severity(tag_name, severity)
+                                if remapped.upper() == 'SUPPRESS':
+                                    # Silently drop this alert — do not show or persist
+                                    continue
+                                # Apply remapped severity
+                                alert['severity'] = remapped.upper()
+                                sev_num_map = {'low': 3, 'medium': 2, 'high': 1, 'critical': 1, 'info': 4}
+                                alert['severity_num'] = sev_num_map.get(remapped.lower(), 3)
+
                             # Add to live alerts list and persist to DB
                             self.alerts.append(alert)
                             try:
@@ -807,6 +964,8 @@ class TsharkCapture:
 
         # Process 2: tshark captures INDEPENDENTLY for live dissection
         # Reads from the same interface — both get copies via PF_PACKET
+        # TCP desegmentation is ON (default) for Wireshark-matching TLS labels.
+        # Frame dedup in _process_packets prevents any count inflation.
         tshark_cmd = [
             'tshark', '-i', iface,     # Capture independently (NOT from stdin)
             '-l',                       # Line-buffered output
@@ -815,7 +974,6 @@ class TsharkCapture:
             '-E', f'separator={FIELD_SEP}',
             '-E', 'quote=n',
             '-E', 'occurrence=f',
-            '-o', 'tcp.desegment_tcp_streams:FALSE',
             # NOTE: Do NOT enable heuristic RTP/RTCP — causes duplicate output lines
         ]
         for field in TSHARK_FIELDS:
@@ -886,11 +1044,27 @@ class TsharkCapture:
             self._cleanup()
 
     def _read_suricata_alerts(self):
-        """Read Suricata alerts from eve.json in real-time."""
+        """Read Suricata alerts from eve.json in real-time.
+
+        Applies severity remapping from severity_remap.yaml and enforces
+        do_not_suppress.yaml protection before displaying/persisting.
+        """
         if not self._suricata:
             return
         try:
             for alert in self._suricata.tail_alerts():
+                # ── Apply severity remap for Suricata alerts ──
+                if self._is_protected_alert(alert):
+                    # Protected alert — keep original severity, never suppress
+                    pass
+                else:
+                    remapped = self._remap_suricata_severity(alert)
+                    if remapped.upper() == 'SUPPRESS':
+                        continue  # Silently drop this alert
+                    alert['severity'] = remapped
+                    sev_num_map = {'LOW': 3, 'MEDIUM': 2, 'HIGH': 1, 'CRITICAL': 1}
+                    alert['severity_num'] = sev_num_map.get(remapped.upper(), 3)
+
                 self.alerts.append(alert)
                 # Store in DB
                 try:
@@ -916,16 +1090,22 @@ class TsharkCapture:
                 pass
             self._suricata = None
 
-        # Terminate dumpcap
+        # Gracefully stop dumpcap — SIGINT lets it flush and close the
+        # pcapng file properly (SIGTERM can truncate mid-write → corrupt file)
         if self._dumpcap:
+            import signal
             try:
-                self._dumpcap.terminate()
-                self._dumpcap.wait(timeout=3)
+                self._dumpcap.send_signal(signal.SIGINT)
+                self._dumpcap.wait(timeout=5)
             except Exception:
                 try:
-                    self._dumpcap.kill()
+                    self._dumpcap.terminate()
+                    self._dumpcap.wait(timeout=3)
                 except Exception:
-                    pass
+                    try:
+                        self._dumpcap.kill()
+                    except Exception:
+                        pass
             self._dumpcap = None
 
         # Terminate tshark

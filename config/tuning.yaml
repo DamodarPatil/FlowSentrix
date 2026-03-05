@@ -1,0 +1,156 @@
+# =============================================================================
+# NetGuard — Master Behavioral Tuning Configuration
+# =============================================================================
+# This file controls NetGuard's BehaviorEngine thresholds, whitelist
+# behavior, and per-detector suppression logic.
+#
+# Loaded by config/__init__.py → used by core/behavior_engine.py
+#
+# Last updated: 2026-03-04
+# =============================================================================
+
+
+# ─── Global Settings ────────────────────────────────────────────────────────
+
+global:
+  # Minimum deployment age (days) before anomaly-based detectors are trusted.
+  # During the learning period, traffic_anomaly and new_dest alerts are
+  # either suppressed or heavily demoted.
+  learning_period_days: 30
+
+  # Path to the IP allowlist file (CIDR format, one per line).
+  # IPs matching any entry are exempt from behavioral alerting.
+  allowlist_file: "config/ip_allowlist.txt"
+
+  # Deployment start date (ISO 8601). Set this to the date NetGuard was
+  # first installed. Used to compute whether learning period has elapsed.
+  # If not set, the first capture session timestamp from DB is used.
+  deployment_date: "2026-03-01"
+
+
+# ─── Semi-Trusted Tier Rules ───────────────────────────────────────────────
+# IPs in the [SEMI-TRUSTED] section of ip_allowlist.txt (NAT64, Cloudflare)
+# get conditional suppression instead of blanket exemption.
+# Attackers routinely abuse these infrastructures for C2, phishing, and staging.
+
+semi_trusted:
+  # Maximum bytes for new_dest / traffic_anomaly suppression.
+  # Above this threshold, alert even for semi-trusted destinations.
+  suppress_max_bytes: 10485760           # 10 MB
+
+  # Data exfiltration: always alert above this threshold to semi-trusted,
+  # but demote severity to MEDIUM instead of HIGH/CRITICAL.
+  exfil_always_alert_bytes: 52428800     # 50 MB
+  exfil_demoted_severity: medium
+
+  # Beaconing: always alert if destination port is non-standard.
+  # Standard ports (443/80) are likely CDN/web traffic — non-standard = suspicious.
+  beaconing_safe_ports:
+    - 443
+    - 80
+
+  # Protocols considered "standard" for semi-trusted destinations.
+  # Any connection using a protocol NOT in this list will never be suppressed.
+  standard_protocols:
+    - TCP
+    - UDP
+    - TLSv1.2
+    - TLSv1.3
+    - QUIC
+    - HTTP
+    - HTTPS
+    - DNS
+
+
+# ─── Beaconing Detector ────────────────────────────────────────────────────
+
+beaconing:
+  # Minimum connections to the same destination before beaconing is checked.
+  # DEFAULT was 5 — raised to 20 to reduce false positives from
+  # browser keep-alives and CDN polling.
+  min_connections: 20
+
+  # Coefficient of Variation threshold (stdev / mean).
+  # CV < this value = "periodic enough to be suspicious".
+  # DEFAULT was 0.20 — unchanged, but see cv_floor_for_trusted below.
+  cv_threshold: 0.20
+
+  # CV floor for trusted/whitelisted destinations.
+  # If destination is in the allowlist AND cv < this value, suppress.
+  # Very regular intervals to CDNs (cv < 0.05) are keepalives, not C2.
+  cv_floor_for_trusted: 0.05
+
+  # Always suppress beaconing to these specific destinations regardless
+  # of other settings. These are KNOWN periodic services.
+  always_suppress_destinations:
+    - "127.0.0.53"      # systemd-resolved DNS stub — beacons every ~2s ALWAYS
+    - "127.0.0.1"       # loopback — never a threat
+    - "::1"             # IPv6 loopback
+
+  # Suppress beaconing alerts to any destination in the global allowlist.
+  suppress_whitelisted: true
+
+
+# ─── Data Exfiltration Detector ─────────────────────────────────────────────
+
+data_exfil:
+  # Minimum bytes to trigger data_exfil alert (per destination).
+  # Applies ONLY to non-whitelisted destinations.
+  # DEFAULT was 50 MB / 200 MB — raised slightly to reduce noise while
+  # still catching real exfiltration. 200 MB catches most malware exfil;
+  # legitimate large transfers (OS updates, Docker images) rarely exceed 500 MB
+  # to a SINGLE unknown destination.
+  threshold_medium_bytes: 209715200     # 200 MB (was 50 MB)
+  threshold_high_bytes: 524288000       # 500 MB (was 200 MB)
+
+  # Suppress data_exfil alerts to whitelisted destinations ENTIRELY.
+  # Google Drive uploads (576 MB, 1321 MB) are legitimate.
+  suppress_whitelisted: true
+
+  # Protocol context: suppress data_exfil when protocol is QUIC (UDP/443)
+  # and destination is whitelisted. QUIC to Google is browser/backup traffic.
+  suppress_quic_to_trusted: true
+
+
+# ─── New Destination Detector ───────────────────────────────────────────────
+
+new_dest:
+  # Keep new_dest ACTIVE during the learning period but demote to INFO.
+  # Full suppression is too aggressive — if malware is installed on day 15,
+  # you'd miss the new C2 destination entirely. Demoting to INFO keeps
+  # visibility while reducing noise in the main alert feed.
+  suppress_during_learning: false
+  learning_period_severity: info
+
+  # After learning period, only alert on new_dest for these conditions:
+  # - Destination port is NOT 443 or 80 (non-HTTPS/HTTP = more suspicious)
+  # - Destination IP is NOT in any major ASN allowlist
+  post_learning_https_only_suppress: true
+
+  # Suppress new_dest ONLY for IPs in the global allowlist (known-good ASNs).
+  # Google, Cloudflare, Meta, Fastly, Azure, AWS — these are never suspicious.
+  # Unknown destinations still generate alerts even during learning.
+  suppress_whitelisted: true
+
+
+# ─── Traffic Anomaly Detector ───────────────────────────────────────────────
+
+traffic_anomaly:
+  # Multiplier threshold: flag if current > N× rolling average.
+  # DEFAULT was 5.0 — unchanged because raising it loses sensitivity.
+  # Instead, we add absolute and baseline maturity filters below.
+  multiplier: 5.0
+
+  # Minimum absolute transfer size (bytes) to trigger anomaly alert.
+  # Ignore anomalies where absolute size is under this threshold,
+  # regardless of the multiplier. A 0.001 MB × 34 = 0.034 MB is not a threat.
+  min_absolute_bytes: 10485760   # 10 MB
+
+  # Minimum baseline age (days) before anomaly scoring is meaningful.
+  # If the rolling average has fewer than this many days of data,
+  # suppress the anomaly alert entirely.
+  min_baseline_days: 14
+
+  # Suppress anomaly alerts to whitelisted destinations unconditionally.
+  # Google/YouTube/CDN traffic volume is inherently bursty.
+  suppress_whitelisted: true

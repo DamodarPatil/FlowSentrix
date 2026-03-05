@@ -1,0 +1,87 @@
+# =============================================================================
+# NetGuard — Alert Severity Classification (3-Tier)
+# =============================================================================
+#
+#   CRITICAL — Active attack, act immediately
+#   MEDIUM   — Suspicious activity, investigate
+#   LOW      — Informational, background noise
+#   SUPPRESS — Drop silently, never show
+#
+# Matching: signature keywords (underscores ↔ spaces are interchangeable)
+# Last updated: 2026-03-05
+# =============================================================================
+
+
+# ─── Behavioral Alert Remapping ──────────────────────────────────────────────
+
+behavioral:
+  # Data exfiltration → CRITICAL (possible data theft in progress)
+  data_exfil:
+    severity: HIGH
+    severity_for_whitelisted: SUPPRESS
+    reason: "Large uploads to unknown IPs = potential data theft."
+
+  # Beaconing → WARNING (suspicious periodic callbacks)
+  beaconing:
+    severity: MEDIUM
+    severity_for_whitelisted: SUPPRESS
+    reason: "Periodic callbacks to unknown IPs could be C2."
+
+  # Traffic anomaly → WARNING (unusual volume spikes)
+  traffic_anomaly:
+    severity: MEDIUM
+    reason: "Volume deviation from baseline — could mean data staging."
+    post_learning_severity: MEDIUM
+
+  # New destination → INFO (informational, not actionable)
+  new_dest:
+    severity: LOW
+    reason: "First connection to IP — useful for forensics, not a threat."
+    post_learning_severity: LOW
+
+
+# ─── Suricata Signature Remapping ────────────────────────────────────────────
+
+suricata:
+
+  # ── CRITICAL: Active threats ──
+
+  NETGUARD_BRUTE_FORCE:
+    severity: HIGH
+    reason: "Brute-force login attempts — confirmed attack."
+
+  NETGUARD_SCAN:
+    severity: HIGH
+    reason: "Port scanning — active reconnaissance, precursor to exploitation."
+
+  ET_SCAN:
+    severity: HIGH
+    reason: "Scanning activity detected by ET rules."
+
+  # ── WARNING: Suspicious, needs investigation ──
+
+  SURICATA:
+    severity: MEDIUM
+    reason: "Protocol anomaly or malformed traffic — possible evasion."
+
+  ET_FILE_SHARING:
+    severity: MEDIUM
+    reason: "File sharing service usage — policy risk."
+
+  # ── INFO: Noise / expected ──
+
+  ET_INFO:
+    severity: LOW
+    reason: "Informational — DNS lookups, IP checks, TLD queries."
+
+  ET_POLICY:
+    severity: LOW
+    reason: "Policy-level events, not threats."
+
+  ET_DNS:
+    severity: LOW
+    reason: "DNS queries to public resolvers — normal."
+
+  ET_GNU:
+    severity: LOW
+    reason: "Package manager traffic — expected system activity."
