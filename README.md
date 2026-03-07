@@ -151,28 +151,17 @@ export csv output.csv       # Export current session to CSV
 
 ### Web Dashboard (GUI)
 
-Start the API server, then open the dashboard:
+You need two terminals — one for the backend API and one for the frontend:
 
 ```bash
 # Terminal 1 — Start the backend API
 sudo venv/bin/python3 web/api.py
 
-# The dashboard is available at:
-# http://localhost:8000
-```
-
-The web GUI serves the pre-built frontend from `web/dist/`. No separate frontend server needed.
-
-**For frontend development** (hot reload):
-
-```bash
-# Terminal 1 — API server
-sudo venv/bin/python3 web/api.py
-
-# Terminal 2 — Vite dev server
+# Terminal 2 — Start the frontend dev server
 cd web && npm run dev
-# Dashboard at http://localhost:5173
 ```
+
+The dashboard will be available at **http://localhost:5173**
 
 ---
 
