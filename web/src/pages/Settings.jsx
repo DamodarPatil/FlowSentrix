@@ -181,7 +181,7 @@ const Settings = () => {
                     <h1 className="page-title">Settings</h1>
                     <p className="page-subtitle">System status and data management</p>
                 </div>
-                <button onClick={fetchData} className="btn-violet" style={{ padding: '0.45rem 0.9rem', fontSize: '0.8rem' }}>
+                <button onClick={fetchData} className="btn-primary" style={{ padding: '0.45rem 0.9rem', fontSize: '0.8rem' }}>
                     <RefreshCw size={13} />
                     Refresh
                 </button>

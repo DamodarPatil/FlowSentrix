@@ -265,7 +265,7 @@ const Connections = () => {
                         {(search || proto || port || tag || dateFrom || dateTo) && ' (filtered)'}
                     </p>
                 </div>
-                <button onClick={fetchConnections} className="btn-primary">
+                <button onClick={fetchConnections} className="btn-primary" style={{ padding: '0.45rem 0.9rem', fontSize: '0.8rem' }}>
                     <RefreshCw size={13} />
                     Refresh
                 </button>

@@ -365,7 +365,7 @@ const Alerts = () => {
                         {grouped ? <Layers size={13} /> : <List size={13} />}
                         {grouped ? 'Grouped' : 'Flat'}
                     </button>
-                    <button onClick={fetchAlerts} className="btn-danger" style={{ padding: '0.45rem 0.9rem', fontSize: '0.8rem' }}>
+                    <button onClick={fetchAlerts} className="btn-primary" style={{ padding: '0.45rem 0.9rem', fontSize: '0.8rem' }}>
                         <RefreshCw size={13} />
                         Refresh
                     </button>
