@@ -1148,19 +1148,9 @@ try:
 except Exception:
     pass
 
-# Fallback descriptions when Gemini is unavailable
-_FALLBACK_DESCRIPTIONS = {
-    "FLOWSENTRIX BRUTE": "🔒 **Brute-force attack detected.** Someone is attempting to guess login credentials by trying many passwords rapidly. This is a confirmed attack — whether from an internal or external source.\n\n🛡️ **Action:** Block the source IP immediately. Check if any logins were successful. If the source is internal, investigate that device for compromise.",
-    "FLOWSENTRIX SCAN": "🔍 **Port scan detected.** A host is probing network ports to discover open services. This is active reconnaissance, often a precursor to exploitation. If the source is an internal IP, the device may be compromised.\n\n🛡️ **Action:** Block the source IP. If internal, investigate the device for malware. Review exposed services on the targeted ports.",
-    "Beaconing": "📡 **Beaconing pattern detected.** A device is connecting to the same destination at regular intervals. This pattern is characteristic of malware command-and-control (C2) callbacks.\n\n🛡️ **Action:** Identify which process is making these connections. Check if the destination is legitimate.",
-    "Data Exfiltration": "📤 **Potential data exfiltration.** An unusually large amount of data is being uploaded to an external destination. This could indicate data theft.\n\n🛡️ **Action:** Verify if this is authorized activity (backup, upload). Check the destination reputation.",
-    "Traffic Anomaly": "📊 **Traffic anomaly detected.** Network traffic to this destination significantly exceeds the historical baseline. Could indicate data staging or compromise.\n\n🛡️ **Action:** Compare with normal usage patterns. Investigate if the volume spike is expected.",
-    "New Destination": "🆕 **New destination observed.** This is the first time your network has connected to this IP address. Informational — useful for forensic context.\n\n🛡️ **Action:** No immediate action needed. Note this for future reference.",
-    "ET INFO": "ℹ️ **Informational event.** This is a routine network event detected by the ET ruleset — DNS lookups, IP checks, or TLD queries. Not a threat.\n\n🛡️ **Action:** No action needed. This is normal network activity.",
-    "ET SCAN": "🔍 **Scanning activity.** The ET ruleset detected scanning activity targeting your network.\n\n🛡️ **Action:** Block the source IP if it's external to your network.",
-    "SURICATA": "⚙️ **Protocol anomaly.** The protocol decoder detected malformed or unexpected protocol behavior. This may indicate evasion attempts or corrupted traffic.\n\n🛡️ **Action:** Review the source/destination IPs. Check for misconfigurations.",
-    "FILE_SHARING": "📁 **File sharing service detected.** A device accessed a public file sharing service. This may indicate data leakage or policy violations.\n\n🛡️ **Action:** Verify this is authorized usage. Check what files were transferred.",
-}
+# Fallback messages when AI is unavailable
+_FALLBACK_NO_KEY = "**AI analysis unavailable.** Configure your Groq API key in ~/.flowsentrix/config.json to enable AI-powered analysis. Get a free key at console.groq.com."
+_FALLBACK_API_ERROR = "**AI analysis failed.** Could not reach the AI service. Check your API key and internet connection, then try again."
 
 
 def _get_ai_key():
@@ -1185,15 +1175,6 @@ def _get_ai_key():
         return ""
 
 
-def _get_fallback(signature: str) -> str:
-    """Get a static fallback description based on signature keywords."""
-    sig_upper = signature.upper()
-    for key, desc in _FALLBACK_DESCRIPTIONS.items():
-        if key.upper() in sig_upper:
-            return desc
-    return "🔎 **Security event detected.** The intrusion detection system flagged this network activity. Review the signature, source, and destination for context.\n\n🛡️ **Action:** Investigate the source and destination IPs. Check if this activity is expected."
-
-
 def _call_ai(alert_data: dict) -> str:
     """Call Groq API to explain an alert. Returns explanation text."""
     import urllib.request
@@ -1201,7 +1182,7 @@ def _call_ai(alert_data: dict) -> str:
 
     api_key = _get_ai_key()
     if not api_key:
-        return ""
+        return "__NO_KEY__"
 
     # Resolve domain names for both IPs so AI can judge legitimacy
     import socket
@@ -1270,7 +1251,7 @@ Alert details:
             data = json.loads(resp.read())
             return data["choices"][0]["message"]["content"]
     except Exception as e:
-        return ""
+        return "__API_ERROR__"
 
 
 from pydantic import BaseModel
@@ -1331,10 +1312,10 @@ def explain_alert(req: ExplainRequest):
     # Call Groq AI
     explanation = _call_ai(req.model_dump())
 
-    if not explanation:
-        # Fallback to static description
-        explanation = _get_fallback(req.signature)
-        return {"ok": True, "explanation": explanation, "cached": False, "source": "fallback"}
+    if explanation == "__NO_KEY__":
+        return {"ok": True, "explanation": _FALLBACK_NO_KEY, "cached": False, "source": "fallback"}
+    if not explanation or explanation == "__API_ERROR__":
+        return {"ok": True, "explanation": _FALLBACK_API_ERROR, "cached": False, "source": "fallback"}
 
     # Cache in DB
     try:
@@ -1388,7 +1369,7 @@ def check_ip_reputation(ip: str):
             pass
 
     if not api_key:
-        return {"ok": False, "error": "AbuseIPDB API key not configured. Add 'abuseipdb_api_key' to ~/.flowsentrix/config.json"}
+        return {"ok": False, "error": "AbuseIPDB API key not configured. Add 'abuseipdb_api_key' to ~/.flowsentrix/config.json. Get a free key at abuseipdb.com."}
 
     # Check if private IP
     if (ip.startswith('10.') or ip.startswith('192.168.') or ip.startswith('172.16.') or
@@ -1430,7 +1411,7 @@ def check_ip_reputation(ip: str):
         _ip_cache[ip] = {'result': result, 'ts': __import__('time').time()}
         return result
     except Exception as e:
-        return {"ok": False, "error": f"API error: {str(e)[:100]}"}
+        return {"ok": False, "error": "Could not reach AbuseIPDB. Check your internet connection and try again."}
 
 
 # ── CSV Export ───────────────────────────────────────────────────
@@ -1562,7 +1543,7 @@ def analyze_connection(req: AnalyzeConnectionRequest):
 
     api_key = _get_ai_key()
     if not api_key:
-        return {"ok": True, "explanation": "⚙️ **Connection profile.** Configure an AI API key in ~/.flowsentrix/config.json to get AI-powered connection analysis.", "cached": False, "source": "fallback"}
+        return {"ok": True, "explanation": _FALLBACK_NO_KEY, "cached": False, "source": "fallback"}
 
     # Reverse DNS
     src_domain, dst_domain = "", ""
@@ -1663,7 +1644,7 @@ Connection:
         explanation = ""
 
     if not explanation:
-        return {"ok": True, "explanation": "🔎 **Connection detected.** Could not reach AI service for analysis. Check your API key and internet connection.", "cached": False, "source": "fallback"}
+        return {"ok": True, "explanation": _FALLBACK_API_ERROR, "cached": False, "source": "fallback"}
 
     # Cache
     try:

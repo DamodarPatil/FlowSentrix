@@ -92,7 +92,7 @@ cd ..
 
 ### 4. Configure (Optional)
 
-Create a config file for AI features and AbuseIPDB:
+Create a config file for AI features and AbuseIPDB in your **home directory** (not the project folder):
 
 ```bash
 mkdir -p ~/.flowsentrix
@@ -103,6 +103,8 @@ cat > ~/.flowsentrix/config.json << 'EOF'
 }
 EOF
 ```
+
+> **Location:** The `~/.flowsentrix` folder is created in your **home directory** (e.g., `/home/username/.flowsentrix`). The `~` symbol is shell shorthand for your home folder. When running with `sudo`, FlowSentrix automatically looks in the original user's home directory.
 
 - **Groq API key** (free): Get from [console.groq.com](https://console.groq.com)
 - **AbuseIPDB API key** (free): Get from [abuseipdb.com](https://www.abuseipdb.com)
@@ -269,4 +271,6 @@ cd web && npx vite build
 
 ## License
 
-College Project — FlowSentrix Team
+MIT License — Copyright (c) 2026 Damodar Patil
+
+See [LICENSE](LICENSE) for details.
