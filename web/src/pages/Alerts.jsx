@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
-    Shield, Zap, AlertTriangle, Search, RefreshCw, Filter,
+    Zap, AlertTriangle, Search, RefreshCw, Filter,
     ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight,
     Layers, List, Radio, ExternalLink, ShieldOff, Sparkles, Globe, X
 } from 'lucide-react'
@@ -610,7 +610,7 @@ const Alerts = () => {
                                                                     borderColor: 'rgba(245,158,11,0.2)',
                                                                     color: '#ccaa44',
                                                                 }}>
-                                                                    <Shield size={11} /> Check {label} IP
+                                                                    Check {label} IP
                                                                 </button>
                                                             )
                                                         }
