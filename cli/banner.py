@@ -34,7 +34,7 @@ def print_banner(db_packets=0, sessions=0, interface=None):
     # System info line
     info_parts = [
         f"[bold green]Version[/]: {VERSION}",
-        f"[bold green]Protocols[/]: 12+",
+        f"[bold green]Protocols[/]: 3000+",
     ]
     if interface:
         info_parts.append(f"[bold green]Interface[/]: {interface}")
