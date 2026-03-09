@@ -27,7 +27,9 @@ body {
 /* ── Sidebar ── */
 .sidebar {
   width: 260px;
-  min-height: 100vh;
+  height: 100vh;
+  position: sticky;
+  top: 0;
   padding: 2rem 1.5rem;
   display: flex;
   flex-direction: column;
@@ -161,6 +163,8 @@ body {
   display: flex;
   flex-direction: column;
   gap: 2rem;
+  min-height: 100vh;
+  overflow-y: auto;
 }
 
 .page-title {
