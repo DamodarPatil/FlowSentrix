@@ -62,8 +62,11 @@ class PacketSniffer:
         self.quiet = on_packet is not None  # Suppress built-in output when external consumer exists
         self.stop_sniffing = threading.Event()
         
-        # Queue-based capture: producer-consumer pattern for zero-drop capture
-        self._packet_queue = queue.Queue(maxsize=0)  # Unlimited buffer
+        # Queue-based capture: producer-consumer pattern.
+        # Bounded size prevents RAM exhaustion when processing lags behind capture.
+        self._max_queue_size = 20000
+        self._packet_queue = queue.Queue(maxsize=self._max_queue_size)
+        self._queue_drops = 0
         self._worker_thread = None
         self._processing_done = threading.Event()
         
@@ -98,6 +101,10 @@ class PacketSniffer:
         # Per-direction window scale factor tracking
         # Key: (ip, port, ip, port) directional  Value: scale factor (e.g., 1024)
         self._tcp_win_scale = {}
+
+        # Hard caps for long-lived flow/state maps.
+        self._max_tcp_state_entries = 50000
+        self._max_tls_flow_entries = 20000
         
         # Get local IP for direction detection
         self.local_ip = self._get_local_ip()
@@ -683,8 +690,10 @@ class PacketSniffer:
                     'orig_ack_pkt_id': self.packet_id,
                     'highest_ack_seen': ack_num if 'ACK' in flag_str else 0
                 }
+                self._trim_dict_to_limit(self._tcp_stream_state, self._max_tcp_state_entries)
                 # Store ISN for this direction (for relative seq calculation)
                 self._tcp_isn_state[fwd_key] = seq
+                self._trim_dict_to_limit(self._tcp_isn_state, self._max_tcp_state_entries)
             return None
         
         fwd_key = (src_ip, src_port, dst_ip, dst_port)
@@ -696,12 +705,14 @@ class PacketSniffer:
         if fwd_key not in self._tcp_isn_state:
             # Use seq-1 as ISN so first packet shows as relative seq=1 (matches Wireshark)
             self._tcp_isn_state[fwd_key] = seq - 1
+            self._trim_dict_to_limit(self._tcp_isn_state, self._max_tcp_state_entries)
         
         # Same for reverse direction ACK numbers - if we're ACKing data but don't
         # have reverse ISN, initialize it based on the ACK number
         if 'ACK' in flag_str and rev_key not in self._tcp_isn_state and ack_num > 0:
             # Use ack-1 as reverse ISN so ack shows as relative ack=1
             self._tcp_isn_state[rev_key] = ack_num - 1
+            self._trim_dict_to_limit(self._tcp_isn_state, self._max_tcp_state_entries)
         
         fwd_key = (src_ip, src_port, dst_ip, dst_port)
         rev_key = (dst_ip, dst_port, src_ip, src_port)
@@ -853,6 +864,7 @@ class PacketSniffer:
             'orig_ack_pkt_id': orig_ack_pkt_id,
             'highest_ack_seen': max(fwd_state.get('highest_ack_seen', ack_num), ack_num) if fwd_state else ack_num
         }
+        self._trim_dict_to_limit(self._tcp_stream_state, self._max_tcp_state_entries)
         
         return label
     
@@ -1045,10 +1057,28 @@ class PacketSniffer:
             if len(payload) > 0 and payload[0] == 0x16:
                 return True
         return False
+
+    @staticmethod
+    def _trim_dict_to_limit(state_dict, limit):
+        """Trim oldest entries from insertion-ordered dict until within limit."""
+        if limit <= 0:
+            return
+        while len(state_dict) > limit:
+            state_dict.pop(next(iter(state_dict)), None)
+
+    def _prune_state_maps(self):
+        """Bound memory usage of long-lived TCP/TLS state maps."""
+        self._trim_dict_to_limit(self._tcp_stream_state, self._max_tcp_state_entries)
+        self._trim_dict_to_limit(self._tcp_isn_state, self._max_tcp_state_entries)
+        self._trim_dict_to_limit(self._tcp_win_scale, self._max_tcp_state_entries)
+        self._trim_dict_to_limit(self._tls_flow_versions, self._max_tls_flow_entries)
     
     def _fast_callback(self, packet):
         """Ultra-fast sniff callback — just queue raw bytes, zero processing."""
-        self._packet_queue.put(bytes(packet))
+        try:
+            self._packet_queue.put_nowait(bytes(packet))
+        except queue.Full:
+            self._queue_drops += 1
     
     def _raw_capture(self, iface, count=0):
         """
@@ -1111,12 +1141,16 @@ class PacketSniffer:
                 while True:
                     try:
                         raw_data = raw_sock.recv(65535)
-                        # Queue RAW BYTES — no Scapy parsing here!
-                        # Worker thread will call Ether(raw_data) later
-                        self._packet_queue.put(raw_data)
                         captured += 1
                         if count > 0 and captured >= count:
                             return
+                        # Queue RAW BYTES — no Scapy parsing here!
+                        # Worker thread will call Ether(raw_data) later
+                        try:
+                            self._packet_queue.put_nowait(raw_data)
+                        except queue.Full:
+                            self._queue_drops += 1
+                            continue
                     except BlockingIOError:
                         break  # No more data available right now
                     except Exception:
@@ -1300,6 +1334,7 @@ class PacketSniffer:
                     for opt_name, opt_val in packet[TCP].options:
                         if opt_name == 'WScale':
                             self._tcp_win_scale[fwd_key] = (1 << opt_val) if opt_val else 1
+                            self._trim_dict_to_limit(self._tcp_win_scale, self._max_tcp_state_entries)
                             break
                 except Exception:
                     pass
@@ -1374,6 +1409,7 @@ class PacketSniffer:
                 # takes precedence over Client Hello (which only advertises)
                 if 'Server Hello' in tls_info or 'Hello Retry Request' in tls_info or flow_key not in self._tls_flow_versions:
                     self._tls_flow_versions[flow_key] = tls_ver
+                    self._trim_dict_to_limit(self._tls_flow_versions, self._max_tls_flow_entries)
                 
                 # Override TLS record version with flow-negotiated version
                 # (e.g., record says TLSv1.0 but flow negotiated TLSv1.3)
@@ -1868,6 +1904,8 @@ class PacketSniffer:
             return
         
         self.packets_captured += 1
+        if (self.packets_captured % 1000) == 0:
+            self._prune_state_maps()
         
         # Extract comprehensive data from raw packet
         data = self.analyze_packet(packet)

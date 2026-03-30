@@ -57,6 +57,7 @@ class FlowSentrixShell(cmd.Cmd):
         self.packet_buffer = []  # Recent packets for display
         self.max_buffer = 100
         self._display_batch = []  # Batched lines for efficient terminal output
+        self._max_display_batch = 2000
         self._batch_lock = threading.Lock()
         
         # Initialize database for stats
@@ -155,6 +156,8 @@ class FlowSentrixShell(cmd.Cmd):
             if self.live_display:
                 with self._batch_lock:
                     self._display_batch.append(data)
+                    if len(self._display_batch) > self._max_display_batch:
+                        del self._display_batch[:-self._max_display_batch]
             return
 
         self.packet_buffer.append(data)
@@ -164,6 +167,8 @@ class FlowSentrixShell(cmd.Cmd):
         if self.live_display:
             with self._batch_lock:
                 self._display_batch.append(data)
+                if len(self._display_batch) > self._max_display_batch:
+                    del self._display_batch[:-self._max_display_batch]
     
     def _flush_display(self):
         """Format and flush batched packets to terminal in one write."""

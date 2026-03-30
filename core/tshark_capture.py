@@ -19,6 +19,7 @@ import queue
 import socket
 import os
 import time
+from collections import deque
 from datetime import datetime
 
 from core.database import FlowSentrixDatabase
@@ -95,8 +96,10 @@ class TsharkCapture:
         self.session_id = None
         self.local_ips = self._get_local_ips()
 
-        # Thread-safe queue for producer-consumer pattern
-        self._packet_queue = queue.Queue(maxsize=0)  # Unbounded
+        # Thread-safe queue for producer-consumer pattern (bounded for memory safety)
+        self._max_queue_size = 30000
+        self._packet_queue = queue.Queue(maxsize=self._max_queue_size)
+        self._queue_drops = 0
 
         # Pcap file path (saved for user — can open in Wireshark)
         self.pcap_file = None
@@ -107,6 +110,8 @@ class TsharkCapture:
         # Frame dedup for live processing (prevents count inflation
         # if TCP reassembly causes duplicate tshark output lines)
         self._live_seen_frames = set()
+        self._live_seen_order = deque()
+        self._max_live_seen_frames = 200000
 
         # Connection/flow tracker (replaces per-packet DB storage)
         self._tracker = ConnectionTracker()
@@ -117,19 +122,24 @@ class TsharkCapture:
         # DNS reverse lookup: IP → domain name (for CDN-aware beaconing detection)
         # Populated from DNS response packets during capture
         self._ip_to_domain = {}
+        self._max_dns_cache_entries = 50000
 
         # Per-flow TLS version tracking: upgrade TLSv1.2 → TLSv1.3 on flows
         # where 1.3 was negotiated (tshark without reassembly uses record-header
         # version 0x0303 which maps to TLSv1.2 even for TLS 1.3 connections)
         # Key: frozenset({(ip, port), (ip, port)})  Value: 'TLSv1.3' etc.
         self._tls_flow_versions = {}
+        self._max_tls_flow_entries = 50000
 
         # Track which behavioral alerts we've already sent (avoid duplicates on each flush)
         self._alerted_behaviors = set()  # {(dst_ip_or_domain, tag_name), ...}
+        self._alerted_behaviors_order = deque()
+        self._max_alerted_behaviors = 100000
 
         # Suricata IDS engine (Process 3)
         self._suricata = None
         self.alerts = []  # Live alerts for CLI access
+        self._max_live_alerts = 5000
 
         # ── Tuning config: severity remap + do-not-suppress ──
         tuning_cfg = load_tuning_config()
@@ -162,6 +172,33 @@ class TsharkCapture:
         except Exception:
             pass
         return ips
+
+    @staticmethod
+    def _trim_dict_to_limit(state_dict, limit):
+        """Trim oldest entries from insertion-ordered dict until within limit."""
+        if limit <= 0:
+            return
+        while len(state_dict) > limit:
+            state_dict.pop(next(iter(state_dict)), None)
+
+    @staticmethod
+    def _trim_list_to_limit(items, limit):
+        """Trim oldest list items from the left until within limit."""
+        if limit <= 0:
+            return
+        overflow = len(items) - limit
+        if overflow > 0:
+            del items[:overflow]
+
+    def _bounded_set_add(self, store_set, store_order, value, limit):
+        """Add value to a set while keeping maximum cardinality bounded."""
+        if value in store_set:
+            return
+        store_set.add(value)
+        store_order.append(value)
+        while len(store_set) > limit and store_order:
+            oldest = store_order.popleft()
+            store_set.discard(oldest)
 
     # ── CSV ──────────────────────────────────────────────────────
 
@@ -296,6 +333,7 @@ class TsharkCapture:
                     self._tls_flow_versions[flow_key] = 'TLSv1.3'
                 elif '0x0303' in versions and flow_key not in self._tls_flow_versions:
                     self._tls_flow_versions[flow_key] = 'TLSv1.2'
+                self._trim_dict_to_limit(self._tls_flow_versions, self._max_tls_flow_entries)
 
             # Upgrade protocol using stored flow version
             known_ver = self._tls_flow_versions.get(flow_key)
@@ -411,6 +449,7 @@ class TsharkCapture:
         if domain and ips:
             for ip in ips:
                 self._ip_to_domain[ip] = domain
+            self._trim_dict_to_limit(self._ip_to_domain, self._max_dns_cache_entries)
 
     # ── Pcapng file helpers ────────────────────────────────────
 
@@ -648,11 +687,23 @@ class TsharkCapture:
                     line = raw_line.decode('utf-8', errors='replace')
                 except Exception:
                     continue
-                self._packet_queue.put(line)
+                try:
+                    self._packet_queue.put_nowait(line)
+                except queue.Full:
+                    self._queue_drops += 1
         except Exception:
             pass
         finally:
-            self._packet_queue.put(None)  # Sentinel
+            # Ensure worker sees sentinel even if queue is currently saturated.
+            while True:
+                try:
+                    self._packet_queue.put_nowait(None)
+                    break
+                except queue.Full:
+                    try:
+                        self._packet_queue.get_nowait()
+                    except queue.Empty:
+                        break
 
     # ── Thread 3: Worker — parse + batch DB + callback ───────────
 
@@ -692,7 +743,12 @@ class TsharkCapture:
             frame_id = data.get('packet_id', 0)
             if frame_id in self._live_seen_frames:
                 continue
-            self._live_seen_frames.add(frame_id)
+            self._bounded_set_add(
+                self._live_seen_frames,
+                self._live_seen_order,
+                frame_id,
+                self._max_live_seen_frames,
+            )
 
             # Update running stats
             self.packets_captured += 1
@@ -846,7 +902,12 @@ class TsharkCapture:
                         alert_key = (dst_display, tag_name)
 
                         if alert_key not in self._alerted_behaviors:
-                            self._alerted_behaviors.add(alert_key)
+                            self._bounded_set_add(
+                                self._alerted_behaviors,
+                                self._alerted_behaviors_order,
+                                alert_key,
+                                self._max_alerted_behaviors,
+                            )
 
                             # Map tag names to user-friendly alert signatures
                             tag_signatures = {
@@ -888,6 +949,7 @@ class TsharkCapture:
 
                             # Add to live alerts list and persist to DB
                             self.alerts.append(alert)
+                            self._trim_list_to_limit(self.alerts, self._max_live_alerts)
                             try:
                                 self._db.insert_alert(alert, self.session_id)
                             except Exception:
@@ -902,6 +964,7 @@ class TsharkCapture:
             self._db.flush_connections(flows, self.session_id)
             # Update known destinations for future new_dest / anomaly detection
             self._db.update_known_destinations(flows)
+            self._tracker.reset()
 
     def _flush_protocol_stats(self):
         """Update protocol_stats table from current in-memory counts."""
@@ -1066,6 +1129,7 @@ class TsharkCapture:
                     alert['severity_num'] = sev_num_map.get(remapped.upper(), 3)
 
                 self.alerts.append(alert)
+                self._trim_list_to_limit(self.alerts, self._max_live_alerts)
                 # Store in DB
                 try:
                     self._db.insert_alert(alert, self.session_id)
@@ -1126,6 +1190,15 @@ class TsharkCapture:
                 self._db.end_session(self.session_id, self.packets_captured, self.total_bytes)
             except Exception:
                 pass
+
+        # Release large runtime caches promptly after capture stops.
+        self._tracker.reset()
+        self._live_seen_frames.clear()
+        self._live_seen_order.clear()
+        self._alerted_behaviors.clear()
+        self._alerted_behaviors_order.clear()
+        self._ip_to_domain.clear()
+        self._tls_flow_versions.clear()
 
         # Close CSV
         if self._csv_fh:
