@@ -359,6 +359,17 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines 
 
 ---
 
+## 👥 Contributors
+
+Thanks to all the people who have contributed to FlowSentrix!
+
+- **Damodar Patil** — Project Creator & Lead Developer
+- **Charmi Bhalala** — Contributor
+- **Manav Patel** — Contributor
+- **Shoab Ansari** — Contributor
+
+---
+
 ## 📞 Support & Community
 
 - 💬 **Discussions:** [GitHub Discussions](https://github.com/DamodarPatil/FlowSentrix/discussions)
