@@ -334,20 +334,6 @@ cd web && npx vite build
 
 ---
 
-## 🚀 Roadmap
-
-**Planned features for upcoming releases:**
-
-- [ ] Machine learning-based anomaly detection
-- [ ] Kubernetes network policy recommendations
-- [ ] YARA rule integration for malware detection
-- [ ] Slack/Teams integration for alerts
-- [ ] Time-travel analysis (historical traffic replay)
-- [ ] GeoIP mapping for traffic visualization
-- [ ] Automated incident enrichment
-- [ ] Multi-node aggregation & correlation
-
----
 
 ## 🤝 Contributing
 
